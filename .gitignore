@@ -17,3 +17,8 @@ Module.symvers
 *~
 *.swp
 .DS_Store
+
+# Agent/tool scratch
+.playwright-mcp/
+*.bin
+*.raw
