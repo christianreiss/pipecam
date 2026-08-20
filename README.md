@@ -277,14 +277,23 @@ device, which then causes `EBUSY` for everything else until you close it.
 The driver stops immediately on an endpoint stall, or after 256 consecutive
 transient URB errors, and reports the failure to userspace (`DQBUF` returns
 `EIO`) rather than stalling silently. Restart the capture to recover; if it
-persists, replug the device. Each new stream explicitly clears a previous USB
-endpoint halt before submitting transfers.
+persists, replug the device or reset it in place (the `usbreset` command is
+provided by `usbutils`):
+
+```sh
+sudo usbreset 3456:4321
+```
+
+Each new stream explicitly clears a previous USB endpoint halt before
+submitting transfers.
 
 ## Verification performed
 
 | Test | Result |
 |---|---|
 | `v4l2-compliance -d /dev/videoN -s` | **57 passed, 0 failed, 0 warnings** |
+| `v4l2-compliance -d /dev/videoN -s --expbuf-device /dev/videoM` | **59 passed, including DMABUF import** |
+| DKMS 3.4 add/build/install in isolated trees | **clean** |
 | Live stream, 600 frames | **zero dropped** (V4L2 sequence contiguous; driver accounts for discarded frames) |
 | Forced 500 ms buffer starvation | **10 dropped frames exposed** as one V4L2 sequence gap |
 | Frame interval stability | <0.1 ms jitter at a given light level |

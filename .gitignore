@@ -12,6 +12,7 @@
 modules.order
 Module.symvers
 *.dwo
+.checkpatch-camelcase.*
 
 # Editor / OS
 *~

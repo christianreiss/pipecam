@@ -349,7 +349,7 @@ static void pipecam_urb_complete(struct urb *urb)
 		stop = dev->stream_failed;
 		first = false;
 		if (!stop && (urb->status == -EPIPE ||
-			     ++dev->urb_errors >= PIPECAM_MAX_URB_ERRORS)) {
+			      ++dev->urb_errors >= PIPECAM_MAX_URB_ERRORS)) {
 			dev->stream_failed = true;
 			stop = true;
 			first = true;
