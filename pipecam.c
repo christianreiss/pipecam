@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * pipecam - V4L2 driver for the "Look Kellyop lem01camera" USB pipe/endoscope
  *           camera (USB ID 3456:4321).
@@ -50,6 +50,7 @@
 #include <linux/mutex.h>
 #include <linux/spinlock.h>
 #include <linux/ktime.h>
+#include <linux/math64.h>
 
 #include <media/v4l2-device.h>
 #include <media/v4l2-ioctl.h>
@@ -75,16 +76,26 @@
 #define PIPECAM_HEIGHT		450U
 #define PIPECAM_BPL		(PIPECAM_WIDTH * 2)		/* 900 */
 #define PIPECAM_IMGSIZE		(PIPECAM_BPL * PIPECAM_HEIGHT)	/* 405000 */
-#define PIPECAM_FPS		20
+/* The sensor runs auto-exposure and lowers its frame rate in poor light:
+ * rates from ~20 to ~27 fps have both been measured on the same unit.  The
+ * rate is therefore measured at runtime and reported through G_PARM rather
+ * than advertised as a fixed value.  These bounds are what ENUM_FRAMEINTERVALS
+ * reports, and the default applies until the first interval is measured.
+ */
+#define PIPECAM_IVAL_MIN_US	33333	/* 30 fps - fastest plausible */
+#define PIPECAM_IVAL_MAX_US	100000	/* 10 fps - slowest plausible */
+#define PIPECAM_IVAL_DEF_US	40000	/* 25 fps until measured */
 
 /* Payload framing. */
 #define PIPECAM_USB_PKT		512
 #define PIPECAM_HDR_MIN		2
 
 /* URB pool.  Buffers are a multiple of the 512-byte packet size so that a
- * short-packet completion always lands on a packet boundary. */
+ * short-packet completion always lands on a packet boundary.
+ */
 #define PIPECAM_NURBS		16
 #define PIPECAM_URB_SIZE	(PIPECAM_USB_PKT * 64)		/* 32 KiB */
+#define PIPECAM_MAX_URB_ERRORS	256
 
 struct pipecam_buf {
 	struct vb2_v4l2_buffer	vb;
@@ -104,6 +115,8 @@ struct pipecam {
 	bool			present;	/* false once disconnected */
 
 	struct urb		*urb[PIPECAM_NURBS];
+	unsigned int		urb_errors;
+	bool			urb_stalled;
 	struct list_head	buf_list;
 
 	/* Frame assembly state, touched from URB completion under qlock. */
@@ -113,6 +126,10 @@ struct pipecam {
 	bool			fid_valid;
 	u8			cur_fid;
 	u32			sequence;
+
+	/* Measured frame interval (EWMA), reported via G_PARM. */
+	u64			last_frame_ns;
+	u32			interval_us;
 };
 
 static inline struct pipecam_buf *to_pipecam_buf(struct vb2_v4l2_buffer *vbuf)
@@ -128,6 +145,7 @@ static inline struct pipecam_buf *to_pipecam_buf(struct vb2_v4l2_buffer *vbuf)
 static void pipecam_frame_end(struct pipecam *dev)
 {
 	struct pipecam_buf *buf = dev->cur;
+	u64 now;
 
 	if (!buf)
 		return;
@@ -135,13 +153,25 @@ static void pipecam_frame_end(struct pipecam *dev)
 	/* Only hand over frames that are exactly the expected size.  Partial
 	 * frames happen after streamon (we may join the stream mid-frame) and
 	 * whenever a URB is dropped; recycle the buffer instead of delivering
-	 * a torn image. */
+	 * a torn image.
+	 */
 	if (dev->cur_off != PIPECAM_IMGSIZE) {
 		dev->cur_off = 0;
 		return;
 	}
 
-	buf->vb.vb2_buf.timestamp = ktime_get_ns();
+	now = ktime_get_ns();
+	if (dev->last_frame_ns) {
+		u32 us = (u32)div_u64(now - dev->last_frame_ns, 1000);
+
+		/* Ignore absurd deltas (first frame after a stall, etc). */
+		if (us >= PIPECAM_IVAL_MIN_US / 2 && us <= PIPECAM_IVAL_MAX_US * 2)
+			dev->interval_us = dev->interval_us ?
+				(dev->interval_us * 7 + us) / 8 : us;
+	}
+	dev->last_frame_ns = now;
+
+	buf->vb.vb2_buf.timestamp = now;
 	buf->vb.sequence = dev->sequence++;
 	buf->vb.field = V4L2_FIELD_NONE;
 	vb2_set_plane_payload(&buf->vb.vb2_buf, 0, PIPECAM_IMGSIZE);
@@ -247,16 +277,39 @@ static void pipecam_urb_complete(struct urb *urb)
 	case -ESHUTDOWN:
 		return;			/* unlinked - we are stopping */
 	default:
+		/* Give up on an endpoint that only produces errors rather than
+		 * resubmitting forever in completion context.  A stall needs
+		 * usb_clear_halt(), which may sleep and so cannot be done here;
+		 * the user can recover by restarting the stream.
+		 */
+		if (++dev->urb_errors > PIPECAM_MAX_URB_ERRORS) {
+			/* Report the failure to userspace instead of stalling
+			 * silently: DQBUF returns EIO and the application can
+			 * recover by restarting the stream.
+			 */
+			if (!dev->urb_stalled) {
+				dev->urb_stalled = true;
+				dev_err(&dev->intf->dev,
+					"endpoint failing (status %d) - stopping stream; restart capture to recover\n",
+					urb->status);
+				vb2_queue_error(&dev->queue);
+			}
+			return;
+		}
 		dev_dbg(&dev->intf->dev, "URB status %d\n", urb->status);
 		goto resubmit;
 	}
+
+	dev->urb_errors = 0;
 
 	if (urb->actual_length > 0)
 		pipecam_process(dev, urb->transfer_buffer, urb->actual_length);
 
 resubmit:
 	ret = usb_submit_urb(urb, GFP_ATOMIC);
-	if (ret && ret != -EPERM)
+	/* -EPERM/-ENODEV/-ESHUTDOWN/-ENOENT are the normal teardown races. */
+	if (ret && ret != -EPERM && ret != -ENODEV &&
+	    ret != -ESHUTDOWN && ret != -ENOENT)
 		dev_err(&dev->intf->dev, "URB resubmit failed: %d\n", ret);
 }
 
@@ -380,6 +433,10 @@ static int pipecam_start_streaming(struct vb2_queue *q, unsigned int count)
 	dev->cur_off = 0;
 	dev->fid_valid = false;
 	dev->sequence = 0;
+	dev->last_frame_ns = 0;
+	dev->interval_us = 0;
+	dev->urb_errors = 0;
+	dev->urb_stalled = false;
 	spin_unlock_irqrestore(&dev->qlock, flags);
 
 	/* Selecting the streaming altsetting is what starts the data flow. */
@@ -428,7 +485,8 @@ static void pipecam_stop_streaming(struct vb2_queue *q)
 
 	/* Altsetting 0 has no IN endpoint, which stops the stream.  Skip the
 	 * transfer if the device is already gone - stop_streaming still runs
-	 * when a client closes its fd after disconnect. */
+	 * when a client closes its fd after disconnect.
+	 */
 	if (dev->present)
 		usb_set_interface(dev->udev, PIPECAM_IFNUM, PIPECAM_ALT_IDLE);
 
@@ -478,6 +536,8 @@ static void pipecam_fill_fmt(struct v4l2_format *f)
 	p->bytesperline	= PIPECAM_BPL;
 	p->sizeimage	= PIPECAM_IMGSIZE;
 	p->colorspace	= V4L2_COLORSPACE_SRGB;
+	/* The sensor emits full-range YCbCr (measured luma 6..254). */
+	p->quantization	= V4L2_QUANTIZATION_FULL_RANGE;
 }
 
 static int pipecam_g_fmt(struct file *file, void *priv, struct v4l2_format *f)
@@ -521,9 +581,16 @@ static int pipecam_enum_frameintervals(struct file *file, void *priv,
 		return -EINVAL;
 	if (fival->width != PIPECAM_WIDTH || fival->height != PIPECAM_HEIGHT)
 		return -EINVAL;
-	fival->type = V4L2_FRMIVAL_TYPE_DISCRETE;
-	fival->discrete.numerator = 1;
-	fival->discrete.denominator = PIPECAM_FPS;
+	/* The rate is exposure-dependent and cannot be set, so advertise the
+	 * plausible range rather than one discrete value.
+	 */
+	fival->type = V4L2_FRMIVAL_TYPE_CONTINUOUS;
+	fival->stepwise.min.numerator = PIPECAM_IVAL_MIN_US;
+	fival->stepwise.min.denominator = USEC_PER_SEC;
+	fival->stepwise.max.numerator = PIPECAM_IVAL_MAX_US;
+	fival->stepwise.max.denominator = USEC_PER_SEC;
+	fival->stepwise.step.numerator = 1;
+	fival->stepwise.step.denominator = 1;
 	return 0;
 }
 
@@ -551,11 +618,27 @@ static int pipecam_s_input(struct file *file, void *priv, unsigned int i)
 static int pipecam_g_parm(struct file *file, void *priv,
 			  struct v4l2_streamparm *parm)
 {
+	struct pipecam *dev = video_drvdata(file);
+	unsigned long flags;
+	u32 us;
+
 	if (parm->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 		return -EINVAL;
+	spin_lock_irqsave(&dev->qlock, flags);
+	us = dev->interval_us;
+	spin_unlock_irqrestore(&dev->qlock, flags);
+	if (!us)
+		us = PIPECAM_IVAL_DEF_US;
+
+	/* V4L2_CAP_TIMEPERFRAME is required whenever ENUM_FRAMEINTERVALS is
+	 * implemented.  The host cannot actually choose the rate - the sensor's
+	 * auto-exposure dictates it - so S_PARM simply reports what is really
+	 * happening, which is the permitted "driver applied what it could"
+	 * response.
+	 */
 	parm->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
-	parm->parm.capture.timeperframe.numerator = 1;
-	parm->parm.capture.timeperframe.denominator = PIPECAM_FPS;
+	parm->parm.capture.timeperframe.numerator = us;
+	parm->parm.capture.timeperframe.denominator = USEC_PER_SEC;
 	parm->parm.capture.readbuffers = 2;
 	return 0;
 }
@@ -709,7 +792,8 @@ static void pipecam_disconnect(struct usb_interface *intf)
 
 	/* Frees dev via pipecam_release() once the last user goes away; the
 	 * USB reference is dropped there, not here, because stop_streaming()
-	 * may still run from a client closing its fd after this returns. */
+	 * may still run from a client closing its fd after this returns.
+	 */
 	v4l2_device_put(&dev->v4l2_dev);
 }
 
@@ -734,5 +818,5 @@ module_usb_driver(pipecam_driver);
 
 MODULE_AUTHOR("Christian Reiss <email@christian-reiss.de>");
 MODULE_DESCRIPTION("V4L2 driver for Look Kellyop lem01camera USB pipe camera");
-MODULE_LICENSE("GPL");
+MODULE_LICENSE("GPL v2");
 MODULE_VERSION("1.0");

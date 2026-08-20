@@ -1,17 +1,92 @@
 # pipecam — Linux V4L2 driver for the "Look Kellyop lem01camera" USB pipe camera
 
-Turns the USB pipe/endoscope camera `3456:4321` into a native `/dev/videoN`
-capture device.
+Makes a vendor-specific USB pipe/endoscope camera (`3456:4321`) work as a native
+`/dev/videoN` capture device. It is **not** a UVC device, so no in-tree driver
+binds it and it is invisible as a webcam on a stock system.
 
-* **Format:** 450×450, `YUYV` (YUV 4:2:2), ~20 fps
-* **Status:** passes `v4l2-compliance` 57/57, 0 failures, 0 warnings
-* **Kernel tested:** 7.1.7-100.fc43.x86_64 (Fedora 43)
+* **Format:** 450×450, `YUYV` (YUV 4:2:2), full-range
+* **Frame rate:** ~20–27 fps, sensor-controlled (see [Frame rate](#frame-rate))
+* **Status:** `v4l2-compliance` 57/57, 0 failures, 0 warnings
+* **Developed and tested on:** Fedora 43, kernel 7.1.7
 
 ---
 
-## Why a custom driver is needed
+## Is this my camera?
 
-The camera is **not** a UVC device, so `uvcvideo` cannot drive it:
+This driver is for one specific vendor protocol, not endoscopes in general.
+**Most USB endoscopes are plain UVC and need no driver at all.** Check:
+
+```sh
+lsusb | grep 3456:4321
+```
+
+You have this device if **all** of the following hold:
+
+1. `lsusb` shows `ID 3456:4321`, with `iProduct` = `lem01camera` and
+   `iManufacturer` = `Look Kellyop`.
+2. **No `/dev/video*` node appears** when you plug it in, and it does not show
+   up in `v4l2-ctl --list-devices`.
+3. The manual or packaging tells you to install the **LinkBack** app
+   (Android `com.lemai.linkback`, iOS `com.jmllm.linkback`).
+
+If your manual names a *different* app — UseePlus, Xscope, i-See-Pro,
+SUP-ANESOK, "Smart Endoscope" — it is a different device and this driver does
+not apply.
+
+> `Look Kellyop` is not a retail brand and `0x3456` is not a USB-IF assigned
+> vendor ID (`3456:4321` is a placeholder). Searching for either will not find
+> your product. Identify by the descriptor strings above.
+
+## Supported hardware
+
+### Retail products
+
+These cameras are white-labelled heavily and **the brand on the box is not a
+reliable identifier** — the same brand ships incompatible units. Only one retail
+product has been positively confirmed to use this protocol:
+
+| Brand | Model / ASIN | Probe | Confirmation |
+|---|---|---|---|
+| Ruycllo | "A8" — `B0GXYT79BM` (amazon.de) | 8 mm, 5 m semi-rigid, 6 LED | listing image instructs installing "Linkback" |
+
+For contrast, Ruycllo `B0FBM53JDK` is a near-identical 8 mm product from the
+*same brand* that uses a different app (`i-See-Pro`) and is **not** supported.
+Use the descriptor test above, not the brand.
+
+### Hardware variants
+
+The vendor app ships `assets/config/cam_config.json` enumerating seven camera
+variants. **450×450 is a documented vendor mode**, which is what this device
+streams and what the driver implements:
+
+| Variant | Sensor | Native resolution | Bytes/frame | Status |
+|---------|--------|-------------------|-------------|--------|
+| 000001 | BF2013 | **450×450** | 405000 | **works** |
+| 000003 | GC0328 | **450×450** | 405000 | **works** |
+| 000005 | BF20A6 | **450×450** | 405000 | **works** |
+| 000004 | BF2013 | 400×400 | 320000 | not implemented |
+| 000011 | BF20A6 | 400×400 | 320000 | not implemented |
+| 000002 | GC0309 | 544×408 (+512×384, 448×336, 320×240) | 443904 | not implemented |
+| 000009 | SP0A39 | 608×456 (+512×384, 448×336, 320×240) | 554496 | not implemented |
+
+All five sensors are cheap VGA-class CMOS parts (GalaxyCore `GC*`, BYD Micro
+`BF*`, SuperPix `SP*`) with no JPEG encoder — which is why the stream is raw YUV
+rather than MJPEG. Any "1920P" claim on the packaging is marketing: a VGA sensor
+behind a cropped transport window, upscaled by the app.
+
+**Which variant is mine?** Unknown, and the driver does not need to know. The
+tested unit streams 450×450, so it is one of BF2013/GC0328/BF20A6. A plausible
+guess is that the config `sn` is the last six digits of the USB serial, but that
+is **unverified and contradicted here**: this unit's serial ends `000002`, which
+would imply the GC0309 544×408 variant, yet it demonstrably streams 450×450
+(405000 bytes/frame, not 443904).
+
+If your unit is one of the other variants the driver will bind but deliver no
+frames, because every frame fails the 405000-byte size check; `dmesg` will not
+report frames. Adjusting `PIPECAM_WIDTH`/`PIPECAM_HEIGHT` in `pipecam.c` should
+suffice — all variants are packed YUYV, so the framing logic is unchanged.
+
+## Why a custom driver is needed
 
 | | |
 |---|---|
@@ -20,23 +95,20 @@ The camera is **not** a UVC device, so `uvcvideo` cannot drive it:
 | Interface 1 | class `0xFF`, subclass `0xF0`, string **"com.linkback.protocol"** |
 
 Both interfaces are vendor-specific. The device is built as an **Apple MFi
-accessory**: interface 0 is the iAP (iPod Accessory Protocol) control channel,
-and interface 1 exposes the External Accessory protocol `com.linkback.protocol`
-that its companion mobile app talks to.
+accessory**: interface 0 is the iAP (iPod Accessory Protocol) channel, and
+interface 1 carries the External Accessory protocol `com.linkback.protocol`.
 
-Crucially, `wTotalLength` is `0x57` (87 bytes), which is *exactly* the standard
-descriptors with nothing left over — the device carries **no UVC class
-descriptors at all**. There is no VideoControl or VideoStreaming descriptor for
-`uvcvideo` to parse, so no amount of quirking or `usbcore` ID forcing will bind
-it.
+`wTotalLength` is `0x57` (87 bytes) — *exactly* the standard descriptors with
+nothing left over, so the device carries **no UVC class descriptors at all**.
+There is no VideoStreaming descriptor for `uvcvideo` to parse, so no amount of
+quirking or ID forcing will bind it.
 
-This driver binds **interface 1 only**. Interface 0 (iAP) is deliberately left
-unclaimed.
+This driver claims **interface 1 only**. Interface 0 is deliberately left
+unclaimed — the vendor's own Android app contains no iAP2/MFi code either and
+drives the device with plain libusb, so the iAP channel is only used when the
+accessory is attached to an iPhone.
 
 ## The wire protocol
-
-Established by capturing and analysing the live device (see *How this was
-determined* below).
 
 ### Starting and stopping the stream
 
@@ -46,17 +118,16 @@ Interface 1 has three altsettings:
 |-----|-----------|------|
 | 0 | bulk OUT `0x02` | idle — **no IN endpoint, so the stream is off** |
 | 1 | bulk IN `0x82`, bulk OUT `0x02` | **streaming (used by this driver)** |
-| 2 | isochronous IN `0x83`, 3×1024 B/µframe | alternative streaming path (unused) |
+| 2 | isochronous IN `0x83`, 3×1024 B/µframe | alternative path (unused here) |
 
 There is **no vendor "start" command**. Selecting altsetting 1 starts the data
 flow; selecting altsetting 0 stops it, because that altsetting has no IN
-endpoint at all. This is the driver's entire streamon/streamoff mechanism.
+endpoint. That is the driver's entire streamon/streamoff mechanism.
 
 ### Payload framing
 
-Every **512-byte USB packet** carries its own UVC-style payload header. Note
-this is per *USB packet*, not per *bulk transfer* — this is the single most
-important detail in the whole protocol:
+The stream is a sequence of variable-length logical packets, each carrying a
+12-byte UVC-style header:
 
 ```
 byte 0     bHeaderLength   always 12
@@ -65,27 +136,59 @@ byte 2..5  PTS
 byte 6..11 SCR
 ```
 
-Observed header-info bytes are `0x8C`/`0x8D` (`EOH|SCR|PTS`, with the frame ID
-toggling between frames) and `0x8E`/`0x8F` for the last packet of each frame.
+Observed header-info bytes are `0x8C`/`0x8D` (`EOH|SCR|PTS`, frame ID toggling
+between frames) and `0x8E`/`0x8F` on the last packet of a frame.
 
-So each packet carries 500 bytes of payload, and one frame is exactly
-**810 packets × 500 bytes = 405000 bytes**.
+**Packets are aligned to 512-byte boundaries within a bulk transfer.** This is
+the single detail that matters most for a reimplementation: a new header begins
+at every 512-byte offset inside the URB buffer, *not* once per transfer. In a
+measurement of 20000 transfers, byte 512 of every one of the 8895 transfers
+longer than 512 bytes was `0x0C` — a header length. A driver that strips 12
+bytes once per transfer produces a subtly **sheared** image that still looks
+almost right.
 
-> **Implementation warning.** A driver that treats one URB as one payload and
-> strips 12 bytes once will produce a subtly *sheared* image that still looks
-> almost right. The header must be stripped from every 512-byte packet inside
-> the URB buffer. URB buffers are therefore sized as a multiple of 512 so a
-> short-packet completion always lands on a packet boundary.
+Packet payloads are therefore **not** uniform: a full 512-byte USB packet
+carries 500 bytes of payload, but each transfer ends in a short packet carrying
+less. Measured over 138950 packets, 50.3% carried exactly 500 bytes and the rest
+were shorter. A frame is **~1040 packets** (1037–1046 observed), always totalling
+**exactly 405000 payload bytes**.
 
 ### Frame geometry and pixel format
 
 ```
-450 × 450, 900 bytes per line, 405000 bytes per frame, YUYV 4:2:2, ~20 fps
+450 × 450, 900 bytes per line, 405000 bytes per frame, YUYV 4:2:2, full range
 ```
+
+Luma occupies even byte offsets, chroma odd offsets. The sensor emits
+**full-range** YCbCr — measured luma spans 6..254, with ~3% of pixels above the
+limited-range white point of 235 — so the driver reports
+`V4L2_QUANTIZATION_FULL_RANGE`.
+
+### Frame rate
+
+**The frame rate is not fixed.** The sensor runs auto-exposure and lowers its
+rate in poor light; 20.7 fps and 27.0 fps have both been measured on the same
+unit under different lighting, each rock-steady at the time (<0.1 ms jitter).
+
+The host cannot select the rate. The driver therefore **measures** the real
+interval and reports it through `VIDIOC_G_PARM`, and advertises a continuous
+10–30 fps range via `VIDIOC_ENUM_FRAMEINTERVALS`, rather than asserting a
+discrete rate that would be wrong half the time.
+
+This matters in practice: a driver hardcoding 20 fps while the camera delivers
+27 makes `ffmpeg` constant-rate-resample and **silently discard about one frame
+in four**.
+
+Bus throughput scales with the rate — roughly 8.4 MB/s at 20 fps and 11.2 MB/s
+at 27 fps.
 
 ## Build and install
 
 Requires `kernel-devel` matching your running kernel, plus `gcc` and `make`.
+
+**Minimum kernel: 6.8.** The driver uses `vb2_queue.min_queued_buffers`, which
+was renamed from `min_buffers_needed` in 6.8. On older kernels the build fails;
+substituting the old field name is the only change needed.
 
 ### Quick build (does not survive a kernel update)
 
@@ -96,11 +199,8 @@ sudo insmod ./pipecam.ko
 
 ### Permanent install via DKMS (recommended)
 
-Fedora ships new kernels frequently; DKMS rebuilds the module automatically so
-it keeps working after an update.
-
 ```sh
-sudo dnf install -y dkms kernel-devel
+sudo dnf install -y dkms kernel-devel     # or: apt install dkms linux-headers-$(uname -r)
 sudo mkdir -p /usr/src/pipecam-1.0
 sudo cp pipecam.c Makefile dkms.conf /usr/src/pipecam-1.0/
 sudo dkms add     -m pipecam -v 1.0
@@ -109,27 +209,26 @@ sudo dkms install -m pipecam -v 1.0
 ```
 
 The module then autoloads on plug-in via its `MODULE_DEVICE_TABLE`.
-
 To remove: `sudo dkms remove -m pipecam -v 1.0 --all`
 
-> **Secure Boot:** this is an out-of-tree, unsigned module. Secure Boot is
-> currently **disabled** on this machine, so it loads fine. If you ever enable
-> it you must enroll a MOK and sign the module, or it will be refused.
+> **Secure Boot:** this is an out-of-tree, unsigned module. With Secure Boot
+> enforcing you must enroll a MOK and sign the module, or it will be refused.
 
 ## Usage
 
-Find the node (it is whichever `/dev/video*` reports `3456:4321`):
+Find the node — it is whichever `/dev/video*` reports `3456:4321`:
 
 ```sh
 v4l2-ctl --list-devices
 ```
 
-Inspect and capture:
+Then:
 
 ```sh
 v4l2-ctl -d /dev/video2 --list-formats-ext
-ffplay -f v4l2 -input_format yuyv422 -video_size 450x450 -i /dev/video2
-ffmpeg -f v4l2 -input_format yuyv422 -video_size 450x450 -i /dev/video2 -frames:v 1 shot.png
+ffplay -f v4l2 -i /dev/video2
+ffmpeg -f v4l2 -i /dev/video2 -frames:v 1 shot.png
+vlc v4l2:///dev/video2
 ```
 
 Access requires membership in the `video` group (or root).
@@ -137,150 +236,115 @@ Access requires membership in the `video` group (or root).
 ### Note on the 450×450 resolution
 
 450 is even, so YUYV macropixels are fine, but it is **not** a multiple of 4, 8
-or 16. Most tools handle it, but some GStreamer paths, hardware encoders and
-browser capture stacks assume aligned dimensions and may complain. If a
-consumer chokes, scale to a friendly size, e.g.:
+or 16. Most tools cope, but some GStreamer paths, hardware encoders and browser
+capture stacks assume aligned dimensions. If a consumer chokes, scale it:
 
 ```sh
-ffmpeg -f v4l2 -input_format yuyv422 -video_size 450x450 -i /dev/video2 \
-       -vf scale=448:448 ...
+ffmpeg -f v4l2 -i /dev/video2 -vf scale=448:448 ...
 ```
 
 ## Troubleshooting
 
 ### `Device or resource busy` (EBUSY)
 
-V4L2 gives one client exclusive access. If another process still holds the
-device you get `EBUSY` — this is normal behaviour, not a fault, and it clears
-as soon as that process exits. Find the holder:
+V4L2 gives one client exclusive access to the queue. `open()` itself succeeds,
+but `VIDIOC_REQBUFS` / starting to stream returns `EBUSY` while another process
+is using the device. This is normal, not a fault, and clears when that process
+exits. Find the holder:
 
 ```sh
 sudo fuser -v /dev/video2      # or: sudo lsof /dev/video2
 ```
 
-A common cause is a **media player left running in the background** after a
-failed attempt: it keeps the file descriptor open even while showing an error.
+A common cause is a media player left running after a failed attempt — it keeps
+the descriptor open while showing an error.
 
 ### VLC
 
-`vlc /dev/video2` does **not** work — VLC treats a bare path as a *file* and
-tries to demux it, giving `filesystem stream error: read error`. Use the
-`v4l2://` access module instead:
+`vlc /dev/video2` does **not** work: VLC treats a bare path as a *file* and
+tries to demux it, reporting `filesystem stream error: read error`. Use the
+`v4l2://` access module:
 
 ```sh
 vlc v4l2:///dev/video2
-vlc "v4l2:///dev/video2:chroma=YUYV:width=450:height=450"    # explicit
 ```
 
-Note the failed file-mode attempt can leave VLC running and holding the device,
-which then causes `EBUSY` for everything else until you close it.
+Note that the failed file-mode attempt leaves VLC running and holding the
+device, which then causes `EBUSY` for everything else until you close it.
+
+### Stream stops and `dmesg` says "endpoint failing"
+
+The driver gives up after 256 consecutive URB errors and reports the failure to
+userspace (`DQBUF` returns `EIO`) rather than stalling silently. Restart the
+capture to recover; if it persists, replug the device.
 
 ## Verification performed
 
 | Test | Result |
 |---|---|
-| `v4l2-compliance -d /dev/video2 -s` | **57 passed, 0 failed, 0 warnings** |
-| Live stream, 600 frames | **zero dropped** (V4L2 sequence 0→599, span exactly 599) |
-| Frame interval | 48.20–48.29 ms (0.09 ms jitter), 20.72 fps sustained |
-| Liveness | **0 byte-identical consecutive frames**; inter-frame MAD 2.3–10.5 |
-| Recorded H.264 file | 450×450, 20 fps, exactly 200 frames in 10.000 s |
-| Frame sizing end-to-end | 5 frames captured = exactly 5 × 405000 bytes |
-| Image correctness | sharp and geometrically correct — no shear or tearing |
-| 5× streamon/streamoff cycles | clean, no errors |
-| Concurrent open | correctly returns `EBUSY` |
-| Hot-unplug while streaming | app gets clean `EIO` on `DQBUF`; node removed; no oops/leak |
-| Rebind after unbind | works |
-| 3× `rmmod`/`insmod` cycles | clean |
-| `dmesg` across all tests | no warnings, no errors |
+| `v4l2-compliance -d /dev/videoN -s` | **57 passed, 0 failed, 0 warnings** |
+| Live stream, 600 frames | **zero dropped** (V4L2 sequence contiguous) |
+| Frame interval stability | <0.1 ms jitter at a given light level |
+| Liveness | **no byte-identical consecutive frames** |
+| Frame sizing | every frame exactly 405000 bytes |
+| Reported vs actual rate | 26.991 fps reported vs 26.987 measured |
+| `ffmpeg` frame retention | 135 frames in 5.00 s = no loss |
+| Concurrent access | second client correctly gets `EBUSY` |
+| Hot-unplug while streaming | clean `EIO`; no oops, WARN or leak |
+| fd held open across unplug, closed after | clean |
+| Rebind, and `rmmod`/`insmod` cycles | clean |
+| `checkpatch.pl` | 0 errors |
+
+Image correctness was confirmed visually — a decoded frame is sharp and
+geometrically straight, with no shear, which independently validates the 900-byte
+stride and the per-512-byte header handling.
 
 ## How this was determined
 
-No public documentation or driver for this device could be found, so the
-protocol was recovered empirically from the device itself:
+No public documentation, driver, or protocol description for this device
+existed. The protocol was recovered empirically:
 
 1. **Descriptor dump** (`lsusb -v` as root) revealed the vendor-specific classes
-   and, decisively, the `iAP Interface` / `com.linkback.protocol` interface
-   strings.
+   and, decisively, the `iAP Interface` / `com.linkback.protocol` strings.
 2. **Blind endpoint probe** showed the device streams unprompted on EP `0x82`
    once altsetting 1 is selected — no init sequence is required.
-3. **Header identification:** `bHeaderLength = 12` with info byte `0x8C`
-   decodes as `EOH|SCR|PTS`, and 2 + 4 (PTS) + 6 (SCR) = 12 bytes exactly —
-   a self-consistent match for a UVC-style payload header. 99.99% of 172,459
-   captured packets had `bHeaderLength = 12`.
+3. **Header identification:** `bHeaderLength = 12` with info byte `0x8C` decodes
+   as `EOH|SCR|PTS`, and 2 + 4 (PTS) + 6 (SCR) = 12 exactly — a self-consistent
+   match for a UVC-style payload header.
 4. **Geometry by autocorrelation** of the payload stream: a strong peak at lag
-   **900** (r = 0.89) with clean harmonics at 1800/2700/3600/4500. Combined with
-   the 405000-byte frame size this gives exactly 450 rows of 900 bytes.
-5. **Pixel format by component statistics:** luma sits on even byte offsets
-   (mean 74, std 79) and chroma on odd offsets (mean **128.1**, std 8.1),
-   with no planar split — i.e. packed 4:2:2 with luma first.
-6. **Visual confirmation:** decoding a captured frame as 450×450 YUYV produced a
-   sharp, correctly proportioned image.
+   **900** with clean harmonics at 1800/2700/3600/4500, giving 450 rows of 900
+   bytes.
+5. **Pixel format by component statistics:** luma on even offsets (std ≈ 79),
+   chroma on odd offsets centred on 128 (std ≈ 8), with no planar split — packed
+   4:2:2, luma first.
+6. **Vendor app analysis** (decompiled APK) supplied the variant table and
+   confirmed the device is driven with plain libusb and matched by USB class
+   rather than VID/PID.
 
 The ASCII-looking bytes `"23xx"` and `".00"` visible early in the stream are a
-red herring — they are just PTS/SCR clock field values inside the 12-byte
-header, not a version string.
-
-## Hardware background
-
-Determined by locating and decompiling the vendor's companion app ("LinkBack",
-Android `com.lemai.linkback`, iOS `com.jmllm.linkback` — the iOS build is what
-declares `com.linkback.protocol`). No public driver, decompilation or protocol
-description for this device existed prior to this work.
-
-* **Sensor:** not determinable from the stream alone. The vendor config lists
-  seven hardware variants, three of which are 450x450 (BF2013, GC0328, BF20A6),
-  so this unit is one of those. All are cheap CMOS sensors with no JPEG
-  encoder, which is why the stream is raw YUV rather than MJPEG.
-* **The vendor app drives this device with plain libusb** — it claims the
-  interface and sets the altsetting, exactly as this driver does. There is **no
-  iAP2/MFi code in the Android app at all**; the iAP channel is used only when
-  the accessory is plugged into an iPhone. Ignoring interface 0 is correct.
-* The app matches the device **by USB class (239/2), not by VID/PID**, which is
-  why the VID/PID appears in no public database.
-* The app changes resolution and pixel clock via **control transfers**
-  (`writeControlEndpointToResolution`, `writeControlEndpointToClk`). The exact
-  request constants live in an obfuscated Dart AOT snapshot and were not
-  recovered.
-
-### Hardware variants
-
-The vendor app ships `assets/config/cam_config.json` enumerating the camera
-variants it supports. **450x450 is a documented vendor mode** - it is what this
-device streams and what the driver implements:
-
-| Variant | Sensor | Native resolution | Bytes/frame | Status here |
-|---------|--------|-------------------|-------------|-------------|
-| 000001 | BF2013 | **450x450** | 405000 | **works - verified on real hardware** |
-| 000003 | GC0328 | **450x450** | 405000 | **works - verified on real hardware** |
-| 000005 | BF20A6 | **450x450** | 405000 | **works - verified on real hardware** |
-| 000004 | BF2013 | 400x400 | 320000 | not implemented |
-| 000011 | BF20A6 | 400x400 | 320000 | not implemented |
-| 000002 | GC0309 | 544x408 (+512x384, 448x336, 320x240) | 443904 | not implemented |
-| 000009 | SP0A39 | 608x456 (+512x384, 448x336, 320x240) | 554496 | not implemented |
-
-Only the 450x450 row is measured. The other rows come from the vendor config
-and are **not** tested here - they are listed so owners of other variants know
-what they are dealing with.
-
-If your unit is one of the other variants the driver will bind but deliver no
-frames, because every frame fails the 405000-byte size check. Adjusting
-`PIPECAM_WIDTH`/`PIPECAM_HEIGHT` in `pipecam.c` should be sufficient: all
-variants are packed YUYV, so the framing logic is unchanged.
+red herring — they are PTS/SCR clock values inside the 12-byte header, not a
+version string.
 
 ## Limitations and unexplored areas
 
-These are outside the scope of "expose the camera as `/dev/video`":
-
-* **Chroma component order is unconfirmed.** Luma/chroma *positions* are certain
-  (proven by the std 80 vs std 6–9 split), but every scene captured during
-  development was essentially neutral — both chroma channels sat within ~2 of
-  128 — so U-vs-V order could not be distinguished. If colours look swapped on a
-  saturated target, change `V4L2_PIX_FMT_YUYV` to `V4L2_PIX_FMT_YVYU` in
-  `pipecam_enum_fmt()` and `pipecam_fill_fmt()`.
-* **Resolution is fixed at 450×450.** Mode switching is known to be possible via
-  control transfers, but the request constants were not recovered.
+* **Chroma component order is unconfirmed.** Luma/chroma *positions* are certain,
+  but every scene captured during development was essentially neutral (both
+  chroma channels within a few counts of 128), so U-vs-V order could not be
+  distinguished. If colours look swapped on a saturated target, change
+  `V4L2_PIX_FMT_YUYV` to `V4L2_PIX_FMT_YVYU` in `pipecam_enum_fmt()` and
+  `pipecam_fill_fmt()`.
+* **Resolution is fixed at 450×450.** The vendor app changes resolution and pixel
+  clock through control transfers, but the request constants live in an
+  obfuscated Dart AOT snapshot and were not recovered.
 * **No controls are exposed** (brightness, LED intensity). The app pushes named
-  GC0309 register lists to the device; that command set was not reverse-engineered.
+  sensor register lists to the device; that command set was not reverse
+  engineered.
 * **The isochronous path (altsetting 2) is unused.** The vendor app uses both;
-  the bulk path here is stable at ~8 MB/s with zero errors over sustained
-  capture, so isochronous bandwidth reservation was not worth taking on.
+  the bulk path here is stable with zero errors over sustained capture, so
+  isochronous bandwidth reservation was not worth taking on.
+* **No suspend/resume handling.** A system sleep force-unbinds the device; replug
+  or restart the capture afterwards.
+
+## License
+
+GPL-2.0-or-later. See [LICENSE](LICENSE).
