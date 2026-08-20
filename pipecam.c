@@ -101,6 +101,7 @@ struct pipecam {
 
 	struct usb_device	*udev;
 	struct usb_interface	*intf;
+	bool			present;	/* false once disconnected */
 
 	struct urb		*urb[PIPECAM_NURBS];
 	struct list_head	buf_list;
@@ -368,6 +369,11 @@ static int pipecam_start_streaming(struct vb2_queue *q, unsigned int count)
 	unsigned long flags;
 	int i, ret;
 
+	if (!dev->present) {
+		pipecam_return_buffers(dev, VB2_BUF_STATE_QUEUED);
+		return -ENODEV;
+	}
+
 	spin_lock_irqsave(&dev->qlock, flags);
 	dev->cur = NULL;
 	dev->cur_vaddr = NULL;
@@ -420,8 +426,11 @@ static void pipecam_stop_streaming(struct vb2_queue *q)
 
 	pipecam_free_urbs(dev);
 
-	/* Altsetting 0 has no IN endpoint, which stops the stream. */
-	usb_set_interface(dev->udev, PIPECAM_IFNUM, PIPECAM_ALT_IDLE);
+	/* Altsetting 0 has no IN endpoint, which stops the stream.  Skip the
+	 * transfer if the device is already gone - stop_streaming still runs
+	 * when a client closes its fd after disconnect. */
+	if (dev->present)
+		usb_set_interface(dev->udev, PIPECAM_IFNUM, PIPECAM_ALT_IDLE);
 
 	pipecam_return_buffers(dev, VB2_BUF_STATE_ERROR);
 }
@@ -598,6 +607,7 @@ static void pipecam_release(struct v4l2_device *v4l2_dev)
 	struct pipecam *dev = container_of(v4l2_dev, struct pipecam, v4l2_dev);
 
 	v4l2_device_unregister(&dev->v4l2_dev);
+	usb_put_dev(dev->udev);
 	mutex_destroy(&dev->lock);
 	kfree(dev);
 }
@@ -616,6 +626,7 @@ static int pipecam_probe(struct usb_interface *intf,
 
 	dev->udev = usb_get_dev(udev);
 	dev->intf = intf;
+	dev->present = true;
 	mutex_init(&dev->lock);
 	spin_lock_init(&dev->qlock);
 	INIT_LIST_HEAD(&dev->buf_list);
@@ -669,7 +680,9 @@ static int pipecam_probe(struct usb_interface *intf,
 	return 0;
 
 err_v4l2:
-	v4l2_device_unregister(&dev->v4l2_dev);
+	/* .release is armed, so this frees dev via pipecam_release(). */
+	v4l2_device_put(&dev->v4l2_dev);
+	return ret;
 err_free:
 	usb_put_dev(dev->udev);
 	mutex_destroy(&dev->lock);
@@ -687,15 +700,16 @@ static void pipecam_disconnect(struct usb_interface *intf)
 	usb_set_intfdata(intf, NULL);
 
 	mutex_lock(&dev->lock);
+	dev->present = false;
 	vb2_queue_error(&dev->queue);
 	mutex_unlock(&dev->lock);
 
 	video_unregister_device(&dev->vdev);
 	v4l2_device_disconnect(&dev->v4l2_dev);
 
-	usb_put_dev(dev->udev);
-
-	/* Frees dev via pipecam_release() once the last user goes away. */
+	/* Frees dev via pipecam_release() once the last user goes away; the
+	 * USB reference is dropped there, not here, because stop_streaming()
+	 * may still run from a client closing its fd after this returns. */
 	v4l2_device_put(&dev->v4l2_dev);
 }
 
@@ -718,6 +732,7 @@ static struct usb_driver pipecam_driver = {
 
 module_usb_driver(pipecam_driver);
 
+MODULE_AUTHOR("Christian Reiss <email@christian-reiss.de>");
 MODULE_DESCRIPTION("V4L2 driver for Look Kellyop lem01camera USB pipe camera");
 MODULE_LICENSE("GPL");
 MODULE_VERSION("1.0");

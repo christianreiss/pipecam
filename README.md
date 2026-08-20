@@ -146,6 +146,35 @@ ffmpeg -f v4l2 -input_format yuyv422 -video_size 450x450 -i /dev/video2 \
        -vf scale=448:448 ...
 ```
 
+## Troubleshooting
+
+### `Device or resource busy` (EBUSY)
+
+V4L2 gives one client exclusive access. If another process still holds the
+device you get `EBUSY` — this is normal behaviour, not a fault, and it clears
+as soon as that process exits. Find the holder:
+
+```sh
+sudo fuser -v /dev/video2      # or: sudo lsof /dev/video2
+```
+
+A common cause is a **media player left running in the background** after a
+failed attempt: it keeps the file descriptor open even while showing an error.
+
+### VLC
+
+`vlc /dev/video2` does **not** work — VLC treats a bare path as a *file* and
+tries to demux it, giving `filesystem stream error: read error`. Use the
+`v4l2://` access module instead:
+
+```sh
+vlc v4l2:///dev/video2
+vlc "v4l2:///dev/video2:chroma=YUYV:width=450:height=450"    # explicit
+```
+
+Note the failed file-mode attempt can leave VLC running and holding the device,
+which then causes `EBUSY` for everything else until you close it.
+
 ## Verification performed
 
 | Test | Result |
