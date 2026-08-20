@@ -16,20 +16,22 @@
  *     endpoint) stops it.  There is no vendor "start" command - the device
  *     streams unprompted as soon as the altsetting is selected.
  *
- *   - Every 512-byte USB packet carries its own UVC-style payload header.
- *     Note this is per USB packet, NOT per bulk transfer:
+ *   - The stream consists of logical packets aligned at 512-byte offsets
+ *     within each bulk transfer.  Every packet carries its own UVC-style
+ *     payload header; the final packet in a transfer is frequently short:
  *
  *         byte 0 : bHeaderLength (always 12 in practice)
  *         byte 1 : bmHeaderInfo - bit0 FID, bit1 EOF, bit2 PTS,
- *                                 bit3 SCR, bit7 EOH
+ *                                 bit3 SCR, bit6 ERR, bit7 EOH
  *         byte 2..5  : PTS
  *         byte 6..11 : SCR
  *
  *     Observed header info bytes are 0x8C/0x8D (EOH|SCR|PTS with the frame ID
  *     toggling) and 0x8E/0x8F for the final packet of each frame.
  *
- *   - Payload is therefore 500 bytes per 512-byte packet, and one frame is
- *     exactly 810 packets: 810 * 500 = 405000 bytes.
+ *   - A full packet therefore carries 500 payload bytes.  Short final packets
+ *     make the packet count variable, but one frame always contains exactly
+ *     405000 payload bytes.
  *
  *   - Frame geometry, recovered by autocorrelation of the payload stream
  *     (strong peak at lag 900 with harmonics at 1800/2700/3600/4500) and
@@ -39,7 +41,8 @@
  *     distribution) while chroma occupies the odd offsets and is tightly
  *     centred on 0x80.
  *
- *   - Measured frame rate is approximately 20 fps.
+ *   - Measured frame rate is approximately 20-27 fps, controlled by the
+ *     sensor's auto-exposure.
  */
 
 #include <linux/module.h>
@@ -90,8 +93,9 @@
 #define PIPECAM_USB_PKT		512
 #define PIPECAM_HDR_MIN		2
 
-/* URB pool.  Buffers are a multiple of the 512-byte packet size so that a
- * short-packet completion always lands on a packet boundary.
+/* URB pool.  Buffers are a multiple of the logical 512-byte packet span.  A
+ * USB short packet ends its bulk transfer and is handled as the final,
+ * shorter logical packet by pipecam_process().
  */
 #define PIPECAM_NURBS		16
 #define PIPECAM_URB_SIZE	(PIPECAM_USB_PKT * 64)		/* 32 KiB */
@@ -108,7 +112,7 @@ struct pipecam {
 	struct vb2_queue	queue;
 
 	struct mutex		lock;	/* serialises ioctls / vb2 queue ops */
-	spinlock_t		qlock;	/* protects buf_list + assembly state */
+	spinlock_t		qlock;	/* queue, assembly and URB error state */
 
 	struct usb_device	*udev;
 	struct usb_interface	*intf;
@@ -116,7 +120,7 @@ struct pipecam {
 
 	struct urb		*urb[PIPECAM_NURBS];
 	unsigned int		urb_errors;
-	bool			urb_stalled;
+	bool			stream_failed;
 	struct list_head	buf_list;
 
 	/* Frame assembly state, touched from URB completion under qlock. */
@@ -124,6 +128,7 @@ struct pipecam {
 	void			*cur_vaddr;
 	unsigned int		cur_off;
 	bool			fid_valid;
+	bool			frame_synced;
 	u8			cur_fid;
 	u32			sequence;
 
@@ -146,6 +151,36 @@ static void pipecam_frame_end(struct pipecam *dev)
 {
 	struct pipecam_buf *buf = dev->cur;
 	u64 now;
+	u32 sequence;
+	bool synced = dev->frame_synced;
+
+	/* After initial synchronization, count every frame boundary, including
+	 * frames dropped because userspace supplied no buffer or because the
+	 * payload was malformed.  This makes gaps in v4l2_buffer.sequence
+	 * meaningful instead of hiding drops.
+	 */
+	now = ktime_get_ns();
+	if (dev->last_frame_ns) {
+		u32 us = (u32)div_u64(now - dev->last_frame_ns, 1000);
+
+		/* Ignore absurd deltas (first frame after a stall, etc). */
+		if (us >= PIPECAM_IVAL_MIN_US / 2 && us <= PIPECAM_IVAL_MAX_US * 2)
+			dev->interval_us = dev->interval_us ?
+				(dev->interval_us * 7 + us) / 8 : us;
+	}
+	dev->last_frame_ns = now;
+	dev->frame_synced = true;
+
+	/* The first boundary after streamon may end a frame that began before
+	 * every URB was submitted.  Use it for synchronization, but do not report
+	 * that unavoidable partial frame as a userspace-visible drop.
+	 */
+	if (!synced && (!buf || dev->cur_off != PIPECAM_IMGSIZE)) {
+		if (buf)
+			dev->cur_off = 0;
+		return;
+	}
+	sequence = dev->sequence++;
 
 	if (!buf)
 		return;
@@ -160,19 +195,8 @@ static void pipecam_frame_end(struct pipecam *dev)
 		return;
 	}
 
-	now = ktime_get_ns();
-	if (dev->last_frame_ns) {
-		u32 us = (u32)div_u64(now - dev->last_frame_ns, 1000);
-
-		/* Ignore absurd deltas (first frame after a stall, etc). */
-		if (us >= PIPECAM_IVAL_MIN_US / 2 && us <= PIPECAM_IVAL_MAX_US * 2)
-			dev->interval_us = dev->interval_us ?
-				(dev->interval_us * 7 + us) / 8 : us;
-	}
-	dev->last_frame_ns = now;
-
 	buf->vb.vb2_buf.timestamp = now;
-	buf->vb.sequence = dev->sequence++;
+	buf->vb.sequence = sequence;
 	buf->vb.field = V4L2_FIELD_NONE;
 	vb2_set_plane_payload(&buf->vb.vb2_buf, 0, PIPECAM_IMGSIZE);
 	vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
@@ -185,6 +209,8 @@ static void pipecam_frame_end(struct pipecam *dev)
 /* Called with qlock held. */
 static void pipecam_append(struct pipecam *dev, const u8 *p, int n)
 {
+	unsigned int room;
+
 	if (n <= 0)
 		return;
 
@@ -205,21 +231,30 @@ static void pipecam_append(struct pipecam *dev, const u8 *p, int n)
 	}
 
 	if (dev->cur_off >= PIPECAM_IMGSIZE) {
-		/* Oversized frame - mark it unusable so frame_end drops it. */
+		/* More payload after a complete image makes the frame unusable. */
 		dev->cur_off = PIPECAM_IMGSIZE + 1;
 		return;
 	}
-	if (dev->cur_off + n > PIPECAM_IMGSIZE)
-		n = PIPECAM_IMGSIZE - dev->cur_off;
+
+	room = PIPECAM_IMGSIZE - dev->cur_off;
+	if (n > room) {
+		/* Copy only within the plane, but retain the oversize marker.  Merely
+		 * truncating here would make frame_end() accept a corrupt frame when
+		 * the oversized payload also carried EOF.
+		 */
+		memcpy(dev->cur_vaddr + dev->cur_off, p, room);
+		dev->cur_off = PIPECAM_IMGSIZE + 1;
+		return;
+	}
 
 	memcpy(dev->cur_vaddr + dev->cur_off, p, n);
 	dev->cur_off += n;
 }
 
 /*
- * Walk one URB buffer.  Each 512-byte USB packet inside it carries its own
- * payload header, so the header must be stripped per packet rather than once
- * per transfer - doing the latter yields a subtly sheared image.
+ * Walk one URB buffer.  Each logical packet at a 512-byte offset carries its
+ * own payload header, so the header must be stripped per packet rather than
+ * once per transfer - doing the latter yields a subtly sheared image.
  */
 static void pipecam_process(struct pipecam *dev, const u8 *data, int len)
 {
@@ -227,6 +262,8 @@ static void pipecam_process(struct pipecam *dev, const u8 *data, int len)
 	int off;
 
 	spin_lock_irqsave(&dev->qlock, flags);
+	if (dev->stream_failed)
+		goto unlock;
 
 	for (off = 0; off < len; off += PIPECAM_USB_PKT) {
 		const u8 *pkt = data + off;
@@ -253,7 +290,15 @@ static void pipecam_process(struct pipecam *dev, const u8 *data, int len)
 		dev->cur_fid = fid;
 		dev->fid_valid = true;
 
-		pipecam_append(dev, pkt + hlen, clen - hlen);
+		/* UVC-style bit 6 marks the current payload as erroneous.  Do not
+		 * allow an exact byte count to turn such a frame into valid output.
+		 */
+		if (info & BIT(6)) {
+			if (dev->cur)
+				dev->cur_off = PIPECAM_IMGSIZE + 1;
+		} else {
+			pipecam_append(dev, pkt + hlen, clen - hlen);
+		}
 
 		if (eof) {
 			pipecam_frame_end(dev);
@@ -261,12 +306,30 @@ static void pipecam_process(struct pipecam *dev, const u8 *data, int len)
 		}
 	}
 
+unlock:
 	spin_unlock_irqrestore(&dev->qlock, flags);
+}
+
+static bool pipecam_fail_stream(struct pipecam *dev)
+{
+	unsigned long flags;
+	bool first;
+
+	spin_lock_irqsave(&dev->qlock, flags);
+	first = !dev->stream_failed;
+	dev->stream_failed = true;
+	spin_unlock_irqrestore(&dev->qlock, flags);
+
+	if (first)
+		vb2_queue_error(&dev->queue);
+	return first;
 }
 
 static void pipecam_urb_complete(struct urb *urb)
 {
 	struct pipecam *dev = urb->context;
+	unsigned long flags;
+	bool stop, first;
 	int ret;
 
 	switch (urb->status) {
@@ -282,25 +345,40 @@ static void pipecam_urb_complete(struct urb *urb)
 		 * usb_clear_halt(), which may sleep and so cannot be done here;
 		 * the user can recover by restarting the stream.
 		 */
-		if (++dev->urb_errors > PIPECAM_MAX_URB_ERRORS) {
+		spin_lock_irqsave(&dev->qlock, flags);
+		stop = dev->stream_failed;
+		first = false;
+		if (!stop && (urb->status == -EPIPE ||
+			     ++dev->urb_errors >= PIPECAM_MAX_URB_ERRORS)) {
+			dev->stream_failed = true;
+			stop = true;
+			first = true;
+		}
+		spin_unlock_irqrestore(&dev->qlock, flags);
+
+		if (first) {
 			/* Report the failure to userspace instead of stalling
 			 * silently: DQBUF returns EIO and the application can
 			 * recover by restarting the stream.
 			 */
-			if (!dev->urb_stalled) {
-				dev->urb_stalled = true;
-				dev_err(&dev->intf->dev,
-					"endpoint failing (status %d) - stopping stream; restart capture to recover\n",
-					urb->status);
-				vb2_queue_error(&dev->queue);
-			}
-			return;
+			dev_err(&dev->intf->dev,
+				"endpoint failing (status %d) - stopping stream; restart capture to recover\n",
+				urb->status);
+			vb2_queue_error(&dev->queue);
 		}
+		if (stop)
+			return;
 		dev_dbg(&dev->intf->dev, "URB status %d\n", urb->status);
 		goto resubmit;
 	}
 
-	dev->urb_errors = 0;
+	spin_lock_irqsave(&dev->qlock, flags);
+	stop = dev->stream_failed;
+	if (!stop)
+		dev->urb_errors = 0;
+	spin_unlock_irqrestore(&dev->qlock, flags);
+	if (stop)
+		return;
 
 	if (urb->actual_length > 0)
 		pipecam_process(dev, urb->transfer_buffer, urb->actual_length);
@@ -309,8 +387,10 @@ resubmit:
 	ret = usb_submit_urb(urb, GFP_ATOMIC);
 	/* -EPERM/-ENODEV/-ESHUTDOWN/-ENOENT are the normal teardown races. */
 	if (ret && ret != -EPERM && ret != -ENODEV &&
-	    ret != -ESHUTDOWN && ret != -ENOENT)
-		dev_err(&dev->intf->dev, "URB resubmit failed: %d\n", ret);
+	    ret != -ESHUTDOWN && ret != -ENOENT &&
+	    pipecam_fail_stream(dev))
+		dev_err(&dev->intf->dev,
+			"URB resubmit failed: %d - stopping stream\n", ret);
 }
 
 /* ------------------------------------------------------------------ */
@@ -419,6 +499,8 @@ static void pipecam_return_buffers(struct pipecam *dev,
 static int pipecam_start_streaming(struct vb2_queue *q, unsigned int count)
 {
 	struct pipecam *dev = vb2_get_drv_priv(q);
+	unsigned int pipe = usb_rcvbulkpipe(dev->udev,
+			PIPECAM_EP_IN & USB_ENDPOINT_NUMBER_MASK);
 	unsigned long flags;
 	int i, ret;
 
@@ -432,11 +514,12 @@ static int pipecam_start_streaming(struct vb2_queue *q, unsigned int count)
 	dev->cur_vaddr = NULL;
 	dev->cur_off = 0;
 	dev->fid_valid = false;
+	dev->frame_synced = false;
 	dev->sequence = 0;
 	dev->last_frame_ns = 0;
 	dev->interval_us = 0;
 	dev->urb_errors = 0;
-	dev->urb_stalled = false;
+	dev->stream_failed = false;
 	spin_unlock_irqrestore(&dev->qlock, flags);
 
 	/* Selecting the streaming altsetting is what starts the data flow. */
@@ -445,6 +528,15 @@ static int pipecam_start_streaming(struct vb2_queue *q, unsigned int count)
 		dev_err(&dev->intf->dev, "set_interface(alt %d) failed: %d\n",
 			PIPECAM_ALT_STREAM, ret);
 		goto err;
+	}
+
+	/* A previous -EPIPE leaves the endpoint halted.  Clearing it here makes
+	 * the documented streamoff/streamon recovery path deterministic.
+	 */
+	ret = usb_clear_halt(dev->udev, pipe);
+	if (ret < 0) {
+		dev_err(&dev->intf->dev, "clear_halt failed: %d\n", ret);
+		goto err_alt;
 	}
 
 	ret = pipecam_alloc_urbs(dev);
@@ -695,6 +787,42 @@ static void pipecam_release(struct v4l2_device *v4l2_dev)
 	kfree(dev);
 }
 
+static int pipecam_validate_interface(struct usb_interface *intf)
+{
+	struct usb_host_interface *idle, *stream;
+	struct usb_endpoint_descriptor *ep;
+	int i, ret;
+
+	idle = usb_altnum_to_altsetting(intf, PIPECAM_ALT_IDLE);
+	stream = usb_altnum_to_altsetting(intf, PIPECAM_ALT_STREAM);
+	if (!idle || !stream)
+		return -ENODEV;
+
+	if (idle->desc.bInterfaceNumber != PIPECAM_IFNUM ||
+	    idle->desc.bInterfaceClass != USB_CLASS_VENDOR_SPEC ||
+	    idle->desc.bInterfaceSubClass != 0xf0 ||
+	    idle->desc.bInterfaceProtocol != 1 ||
+	    stream->desc.bInterfaceNumber != PIPECAM_IFNUM ||
+	    stream->desc.bInterfaceClass != USB_CLASS_VENDOR_SPEC ||
+	    stream->desc.bInterfaceSubClass != 0xf0 ||
+	    stream->desc.bInterfaceProtocol != 1)
+		return -ENODEV;
+
+	/* The idle setting must really stop input, otherwise disconnect and
+	 * streamoff would leave an unknown device transmitting.
+	 */
+	for (i = 0; i < idle->desc.bNumEndpoints; i++)
+		if (usb_endpoint_dir_in(&idle->endpoint[i].desc))
+			return -ENODEV;
+
+	ret = usb_find_bulk_in_endpoint(stream, &ep);
+	if (ret || ep->bEndpointAddress != PIPECAM_EP_IN ||
+	    usb_endpoint_maxp(ep) != PIPECAM_USB_PKT)
+		return -ENODEV;
+
+	return 0;
+}
+
 static int pipecam_probe(struct usb_interface *intf,
 			 const struct usb_device_id *id)
 {
@@ -702,6 +830,12 @@ static int pipecam_probe(struct usb_interface *intf,
 	struct pipecam *dev;
 	struct vb2_queue *q;
 	int ret;
+
+	ret = pipecam_validate_interface(intf);
+	if (ret) {
+		dev_err(&intf->dev, "unsupported interface layout\n");
+		return ret;
+	}
 
 	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
 	if (!dev)
@@ -715,7 +849,12 @@ static int pipecam_probe(struct usb_interface *intf,
 	INIT_LIST_HEAD(&dev->buf_list);
 
 	/* Make sure we start from the idle altsetting. */
-	usb_set_interface(udev, PIPECAM_IFNUM, PIPECAM_ALT_IDLE);
+	ret = usb_set_interface(udev, PIPECAM_IFNUM, PIPECAM_ALT_IDLE);
+	if (ret) {
+		dev_err(&intf->dev, "set_interface(alt %d) failed: %d\n",
+			PIPECAM_ALT_IDLE, ret);
+		goto err_free;
+	}
 
 	dev->v4l2_dev.release = pipecam_release;
 	ret = v4l2_device_register(&intf->dev, &dev->v4l2_dev);

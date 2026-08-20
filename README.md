@@ -274,16 +274,19 @@ device, which then causes `EBUSY` for everything else until you close it.
 
 ### Stream stops and `dmesg` says "endpoint failing"
 
-The driver gives up after 256 consecutive URB errors and reports the failure to
-userspace (`DQBUF` returns `EIO`) rather than stalling silently. Restart the
-capture to recover; if it persists, replug the device.
+The driver stops immediately on an endpoint stall, or after 256 consecutive
+transient URB errors, and reports the failure to userspace (`DQBUF` returns
+`EIO`) rather than stalling silently. Restart the capture to recover; if it
+persists, replug the device. Each new stream explicitly clears a previous USB
+endpoint halt before submitting transfers.
 
 ## Verification performed
 
 | Test | Result |
 |---|---|
 | `v4l2-compliance -d /dev/videoN -s` | **57 passed, 0 failed, 0 warnings** |
-| Live stream, 600 frames | **zero dropped** (V4L2 sequence contiguous) |
+| Live stream, 600 frames | **zero dropped** (V4L2 sequence contiguous; driver accounts for discarded frames) |
+| Forced 500 ms buffer starvation | **10 dropped frames exposed** as one V4L2 sequence gap |
 | Frame interval stability | <0.1 ms jitter at a given light level |
 | Liveness | **no byte-identical consecutive frames** |
 | Frame sizing | every frame exactly 405000 bytes |
@@ -342,8 +345,9 @@ version string.
 * **The isochronous path (altsetting 2) is unused.** The vendor app uses both;
   the bulk path here is stable with zero errors over sustained capture, so
   isochronous bandwidth reservation was not worth taking on.
-* **No suspend/resume handling.** A system sleep force-unbinds the device; replug
-  or restart the capture afterwards.
+* **No transparent suspend/resume handling.** USB core safely disconnects and
+  reprobes the driver when it cannot preserve the interface, but an active
+  capture application must close and reopen the video node after resume.
 
 ## License
 
