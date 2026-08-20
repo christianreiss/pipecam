@@ -227,9 +227,10 @@ Android `com.lemai.linkback`, iOS `com.jmllm.linkback` — the iOS build is what
 declares `com.linkback.protocol`). No public driver, decompilation or protocol
 description for this device existed prior to this work.
 
-* **Sensor:** GalaxyCore **GC0309** — 1/9" VGA, 648×488 array, outputs Bayer /
-  RGB565 / **YCbCr 4:2:2**, ≤30 fps. It has no JPEG encoder, which is why the
-  stream is raw YUV rather than MJPEG.
+* **Sensor:** not determinable from the stream alone. The vendor config lists
+  seven hardware variants, three of which are 450x450 (BF2013, GC0328, BF20A6),
+  so this unit is one of those. All are cheap CMOS sensors with no JPEG
+  encoder, which is why the stream is raw YUV rather than MJPEG.
 * **The vendor app drives this device with plain libusb** — it claims the
   interface and sets the altsetting, exactly as this driver does. There is **no
   iAP2/MFi code in the Android app at all**; the iAP channel is used only when
@@ -241,15 +242,30 @@ description for this device existed prior to this work.
   request constants live in an obfuscated Dart AOT snapshot and were not
   recovered.
 
-### A note on resolution
+### Hardware variants
 
-The vendor app's `assets/config/cam_config.json` maps this unit's serial suffix
-(`000002`) to a GC0309 at 544×408. **This device measurably streams 450×450**
-(405000 bytes/frame, stride 900) in its default power-on mode, which is what
-this driver implements. 544×408 would be 443904 bytes/frame and would render
-visibly sheared; it does not match the capture. The discrepancy is most likely
-because the app selects a mode via control transfer at startup, whereas this
-driver uses the device's own default. Recorded here as an open question.
+The vendor app ships `assets/config/cam_config.json` enumerating the camera
+variants it supports. **450x450 is a documented vendor mode** - it is what this
+device streams and what the driver implements:
+
+| Variant | Sensor | Native resolution | Bytes/frame | Status here |
+|---------|--------|-------------------|-------------|-------------|
+| 000001 | BF2013 | **450x450** | 405000 | **works - verified on real hardware** |
+| 000003 | GC0328 | **450x450** | 405000 | **works - verified on real hardware** |
+| 000005 | BF20A6 | **450x450** | 405000 | **works - verified on real hardware** |
+| 000004 | BF2013 | 400x400 | 320000 | not implemented |
+| 000011 | BF20A6 | 400x400 | 320000 | not implemented |
+| 000002 | GC0309 | 544x408 (+512x384, 448x336, 320x240) | 443904 | not implemented |
+| 000009 | SP0A39 | 608x456 (+512x384, 448x336, 320x240) | 554496 | not implemented |
+
+Only the 450x450 row is measured. The other rows come from the vendor config
+and are **not** tested here - they are listed so owners of other variants know
+what they are dealing with.
+
+If your unit is one of the other variants the driver will bind but deliver no
+frames, because every frame fails the 405000-byte size check. Adjusting
+`PIPECAM_WIDTH`/`PIPECAM_HEIGHT` in `pipecam.c` should be sufficient: all
+variants are packed YUYV, so the framing logic is unchanged.
 
 ## Limitations and unexplored areas
 
