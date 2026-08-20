@@ -170,14 +170,11 @@ limited-range white point of 235 — so the driver reports
 rate in poor light; 20.7 fps and 27.0 fps have both been measured on the same
 unit under different lighting, each rock-steady at the time (<0.1 ms jitter).
 
-The host cannot select the rate. The driver therefore **measures** the real
-interval and reports it through `VIDIOC_G_PARM`, and advertises a continuous
-10–30 fps range via `VIDIOC_ENUM_FRAMEINTERVALS`, rather than asserting a
-discrete rate that would be wrong half the time.
-
-This matters in practice: a driver hardcoding 20 fps while the camera delivers
-27 makes `ffmpeg` constant-rate-resample and **silently discard about one frame
-in four**.
+The host cannot select the rate, so the driver deliberately does not implement
+`VIDIOC_ENUM_FRAMEINTERVALS`, `VIDIOC_G_PARM`, or `VIDIOC_S_PARM`. Advertising
+a range there would promise selectable frame periods that the hardware cannot
+provide. Each completed buffer instead receives its real monotonic capture
+timestamp, which preserves the exposure-driven cadence for consumers.
 
 Bus throughput scales with the rate — roughly 8.4 MB/s at 20 fps and 11.2 MB/s
 at 27 fps.
@@ -287,7 +284,20 @@ sudo usbreset 3456:4321
 Each new stream explicitly clears a previous USB endpoint halt before
 submitting transfers.
 
+### Capture interrupted by suspend or USB reset
+
+The driver preserves the registered video node and open file handles across a
+system suspend/resume or USB reset. If capture was active, it stops all URBs and
+puts the VB2 queue into error rather than continuing a partial frame. Userspace
+must issue `STREAMOFF`, requeue its buffers, and issue `STREAMON`; applications
+that close and reopen the node already perform an equivalent recovery.
+
 ## Verification performed
+
+The hardware results below are the established baseline from before the current
+interval-UAPI and suspend/reset hardening. They remain regression targets and
+must be rerun on the physical camera; the wire format and successful-frame path
+did not change, while malformed-frame rejection became stricter.
 
 | Test | Result |
 |---|---|
@@ -299,8 +309,8 @@ submitting transfers.
 | Frame interval stability | <0.1 ms jitter at a given light level |
 | Liveness | **no byte-identical consecutive frames** |
 | Frame sizing | every frame exactly 405000 bytes |
-| Reported vs actual rate | 26.991 fps reported vs 26.987 measured |
-| `ffmpeg` frame retention | 135 frames in 5.00 s = no loss |
+| Timestamp-derived rate | 26.987 fps measured from completed buffers |
+| `ffmpeg` frame retention | 135 frames in 5.00 s = no loss in the tested capture |
 | Concurrent access | second client correctly gets `EBUSY` |
 | Hot-unplug while streaming | clean `EIO`; no oops, WARN or leak |
 | fd held open across unplug, closed after | clean |
@@ -354,9 +364,9 @@ version string.
 * **The isochronous path (altsetting 2) is unused.** The vendor app uses both;
   the bulk path here is stable with zero errors over sustained capture, so
   isochronous bandwidth reservation was not worth taking on.
-* **No transparent suspend/resume handling.** USB core safely disconnects and
-  reprobes the driver when it cannot preserve the interface, but an active
-  capture application must close and reopen the video node after resume.
+* **No transparent stream continuation after suspend/reset.** The node and file
+  handles survive, but an active capture queue enters error and must be restarted
+  with `STREAMOFF`, buffer requeueing, and `STREAMON`.
 
 ## License
 

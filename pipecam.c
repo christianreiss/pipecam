@@ -53,12 +53,9 @@
 #include <linux/mutex.h>
 #include <linux/spinlock.h>
 #include <linux/ktime.h>
-#include <linux/math64.h>
 
 #include <media/v4l2-device.h>
 #include <media/v4l2-ioctl.h>
-#include <media/v4l2-event.h>
-#include <media/v4l2-ctrls.h>
 #include <media/videobuf2-v4l2.h>
 #include <media/videobuf2-vmalloc.h>
 
@@ -79,16 +76,6 @@
 #define PIPECAM_HEIGHT		450U
 #define PIPECAM_BPL		(PIPECAM_WIDTH * 2)		/* 900 */
 #define PIPECAM_IMGSIZE		(PIPECAM_BPL * PIPECAM_HEIGHT)	/* 405000 */
-/* The sensor runs auto-exposure and lowers its frame rate in poor light:
- * rates from ~20 to ~27 fps have both been measured on the same unit.  The
- * rate is therefore measured at runtime and reported through G_PARM rather
- * than advertised as a fixed value.  These bounds are what ENUM_FRAMEINTERVALS
- * reports, and the default applies until the first interval is measured.
- */
-#define PIPECAM_IVAL_MIN_US	33333	/* 30 fps - fastest plausible */
-#define PIPECAM_IVAL_MAX_US	100000	/* 10 fps - slowest plausible */
-#define PIPECAM_IVAL_DEF_US	40000	/* 25 fps until measured */
-
 /* Payload framing. */
 #define PIPECAM_USB_PKT		512
 #define PIPECAM_HDR_MIN		2
@@ -129,12 +116,9 @@ struct pipecam {
 	unsigned int		cur_off;
 	bool			fid_valid;
 	bool			frame_synced;
+	bool			frame_bad;
 	u8			cur_fid;
 	u32			sequence;
-
-	/* Measured frame interval (EWMA), reported via G_PARM. */
-	u64			last_frame_ns;
-	u32			interval_us;
 };
 
 static inline struct pipecam_buf *to_pipecam_buf(struct vb2_v4l2_buffer *vbuf)
@@ -152,7 +136,10 @@ static void pipecam_frame_end(struct pipecam *dev)
 	struct pipecam_buf *buf = dev->cur;
 	u64 now;
 	u32 sequence;
+	bool bad = dev->frame_bad;
 	bool synced = dev->frame_synced;
+
+	dev->frame_bad = false;
 
 	/* After initial synchronization, count every frame boundary, including
 	 * frames dropped because userspace supplied no buffer or because the
@@ -160,22 +147,13 @@ static void pipecam_frame_end(struct pipecam *dev)
 	 * meaningful instead of hiding drops.
 	 */
 	now = ktime_get_ns();
-	if (dev->last_frame_ns) {
-		u32 us = (u32)div_u64(now - dev->last_frame_ns, 1000);
-
-		/* Ignore absurd deltas (first frame after a stall, etc). */
-		if (us >= PIPECAM_IVAL_MIN_US / 2 && us <= PIPECAM_IVAL_MAX_US * 2)
-			dev->interval_us = dev->interval_us ?
-				(dev->interval_us * 7 + us) / 8 : us;
-	}
-	dev->last_frame_ns = now;
 	dev->frame_synced = true;
 
 	/* The first boundary after streamon may end a frame that began before
 	 * every URB was submitted.  Use it for synchronization, but do not report
 	 * that unavoidable partial frame as a userspace-visible drop.
 	 */
-	if (!synced && (!buf || dev->cur_off != PIPECAM_IMGSIZE)) {
+	if (!synced && (bad || !buf || dev->cur_off != PIPECAM_IMGSIZE)) {
 		if (buf)
 			dev->cur_off = 0;
 		return;
@@ -190,7 +168,7 @@ static void pipecam_frame_end(struct pipecam *dev)
 	 * whenever a URB is dropped; recycle the buffer instead of delivering
 	 * a torn image.
 	 */
-	if (dev->cur_off != PIPECAM_IMGSIZE) {
+	if (bad || dev->cur_off != PIPECAM_IMGSIZE) {
 		dev->cur_off = 0;
 		return;
 	}
@@ -271,15 +249,19 @@ static void pipecam_process(struct pipecam *dev, const u8 *data, int len)
 		u8 hlen, info, fid;
 		bool eof;
 
-		if (clen < PIPECAM_HDR_MIN)
+		if (clen < PIPECAM_HDR_MIN) {
+			dev->frame_bad = true;
 			break;
+		}
 
 		hlen = pkt[0];
 		info = pkt[1];
 
 		/* Ignore malformed packets rather than resynchronising blindly. */
-		if (hlen < PIPECAM_HDR_MIN || hlen > clen)
+		if (hlen < PIPECAM_HDR_MIN || hlen > clen) {
+			dev->frame_bad = true;
 			continue;
+		}
 
 		fid = info & 0x01;
 		eof = !!(info & 0x02);
@@ -293,12 +275,10 @@ static void pipecam_process(struct pipecam *dev, const u8 *data, int len)
 		/* UVC-style bit 6 marks the current payload as erroneous.  Do not
 		 * allow an exact byte count to turn such a frame into valid output.
 		 */
-		if (info & BIT(6)) {
-			if (dev->cur)
-				dev->cur_off = PIPECAM_IMGSIZE + 1;
-		} else {
+		if (info & BIT(6))
+			dev->frame_bad = true;
+		else
 			pipecam_append(dev, pkt + hlen, clen - hlen);
-		}
 
 		if (eof) {
 			pipecam_frame_end(dev);
@@ -410,6 +390,15 @@ static void pipecam_free_urbs(struct pipecam *dev)
 	}
 }
 
+static void pipecam_kill_urbs(struct pipecam *dev)
+{
+	int i;
+
+	for (i = 0; i < PIPECAM_NURBS; i++)
+		if (dev->urb[i])
+			usb_kill_urb(dev->urb[i]);
+}
+
 static int pipecam_alloc_urbs(struct pipecam *dev)
 {
 	unsigned int pipe = usb_rcvbulkpipe(dev->udev,
@@ -496,6 +485,17 @@ static void pipecam_return_buffers(struct pipecam *dev,
 	spin_unlock_irqrestore(&dev->qlock, flags);
 }
 
+static int pipecam_set_idle(struct pipecam *dev)
+{
+	int ret;
+
+	ret = usb_set_interface(dev->udev, PIPECAM_IFNUM, PIPECAM_ALT_IDLE);
+	if (ret)
+		dev_dbg(&dev->intf->dev,
+			"failed to restore idle altsetting: %d\n", ret);
+	return ret;
+}
+
 static int pipecam_start_streaming(struct vb2_queue *q, unsigned int count)
 {
 	struct pipecam *dev = vb2_get_drv_priv(q);
@@ -515,9 +515,8 @@ static int pipecam_start_streaming(struct vb2_queue *q, unsigned int count)
 	dev->cur_off = 0;
 	dev->fid_valid = false;
 	dev->frame_synced = false;
+	dev->frame_bad = false;
 	dev->sequence = 0;
-	dev->last_frame_ns = 0;
-	dev->interval_us = 0;
 	dev->urb_errors = 0;
 	dev->stream_failed = false;
 	spin_unlock_irqrestore(&dev->qlock, flags);
@@ -539,10 +538,6 @@ static int pipecam_start_streaming(struct vb2_queue *q, unsigned int count)
 		goto err_alt;
 	}
 
-	ret = pipecam_alloc_urbs(dev);
-	if (ret)
-		goto err_alt;
-
 	for (i = 0; i < PIPECAM_NURBS; i++) {
 		ret = usb_submit_urb(dev->urb[i], GFP_KERNEL);
 		if (ret) {
@@ -556,9 +551,8 @@ static int pipecam_start_streaming(struct vb2_queue *q, unsigned int count)
 err_urbs:
 	while (i--)
 		usb_kill_urb(dev->urb[i]);
-	pipecam_free_urbs(dev);
 err_alt:
-	usb_set_interface(dev->udev, PIPECAM_IFNUM, PIPECAM_ALT_IDLE);
+	pipecam_set_idle(dev);
 err:
 	pipecam_return_buffers(dev, VB2_BUF_STATE_QUEUED);
 	return ret;
@@ -567,13 +561,8 @@ err:
 static void pipecam_stop_streaming(struct vb2_queue *q)
 {
 	struct pipecam *dev = vb2_get_drv_priv(q);
-	int i;
 
-	for (i = 0; i < PIPECAM_NURBS; i++)
-		if (dev->urb[i])
-			usb_kill_urb(dev->urb[i]);
-
-	pipecam_free_urbs(dev);
+	pipecam_kill_urbs(dev);
 
 	/* Altsetting 0 has no IN endpoint, which stops the stream.  Skip the
 	 * transfer when tearing down from disconnect (present is cleared
@@ -581,7 +570,7 @@ static void pipecam_stop_streaming(struct vb2_queue *q)
 	 * right after unbind anyway.
 	 */
 	if (dev->present)
-		usb_set_interface(dev->udev, PIPECAM_IFNUM, PIPECAM_ALT_IDLE);
+		pipecam_set_idle(dev);
 
 	pipecam_return_buffers(dev, VB2_BUF_STATE_ERROR);
 }
@@ -673,26 +662,6 @@ static int pipecam_enum_framesizes(struct file *file, void *priv,
 	return 0;
 }
 
-static int pipecam_enum_frameintervals(struct file *file, void *priv,
-				       struct v4l2_frmivalenum *fival)
-{
-	if (fival->index || fival->pixel_format != V4L2_PIX_FMT_YUYV)
-		return -EINVAL;
-	if (fival->width != PIPECAM_WIDTH || fival->height != PIPECAM_HEIGHT)
-		return -EINVAL;
-	/* The rate is exposure-dependent and cannot be set, so advertise the
-	 * plausible range rather than one discrete value.
-	 */
-	fival->type = V4L2_FRMIVAL_TYPE_CONTINUOUS;
-	fival->stepwise.min.numerator = PIPECAM_IVAL_MIN_US;
-	fival->stepwise.min.denominator = USEC_PER_SEC;
-	fival->stepwise.max.numerator = PIPECAM_IVAL_MAX_US;
-	fival->stepwise.max.denominator = USEC_PER_SEC;
-	fival->stepwise.step.numerator = 1;
-	fival->stepwise.step.denominator = 1;
-	return 0;
-}
-
 static int pipecam_enum_input(struct file *file, void *priv,
 			      struct v4l2_input *inp)
 {
@@ -714,38 +683,6 @@ static int pipecam_s_input(struct file *file, void *priv, unsigned int i)
 	return i ? -EINVAL : 0;
 }
 
-static int pipecam_g_parm(struct file *file, void *priv,
-			  struct v4l2_streamparm *parm)
-{
-	struct pipecam *dev = video_drvdata(file);
-	unsigned long flags;
-	u32 us;
-
-	if (parm->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
-		return -EINVAL;
-	spin_lock_irqsave(&dev->qlock, flags);
-	us = dev->interval_us;
-	spin_unlock_irqrestore(&dev->qlock, flags);
-	if (!us)
-		us = PIPECAM_IVAL_DEF_US;
-
-	/* V4L2_CAP_TIMEPERFRAME is required whenever ENUM_FRAMEINTERVALS is
-	 * implemented.  The host cannot actually choose the rate - the sensor's
-	 * auto-exposure dictates it - so S_PARM simply reports what is really
-	 * happening, which is the permitted "driver applied what it could"
-	 * response.
-	 */
-	parm->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
-	/* S_PARM shares this handler; overwrite the caller's capturemode
-	 * rather than echoing it (high-quality mode is not supported).
-	 */
-	parm->parm.capture.capturemode = 0;
-	parm->parm.capture.timeperframe.numerator = us;
-	parm->parm.capture.timeperframe.denominator = USEC_PER_SEC;
-	parm->parm.capture.readbuffers = 2;
-	return 0;
-}
-
 static const struct v4l2_ioctl_ops pipecam_ioctl_ops = {
 	.vidioc_querycap		= pipecam_querycap,
 	.vidioc_enum_fmt_vid_cap	= pipecam_enum_fmt,
@@ -753,12 +690,9 @@ static const struct v4l2_ioctl_ops pipecam_ioctl_ops = {
 	.vidioc_s_fmt_vid_cap		= pipecam_s_fmt,
 	.vidioc_try_fmt_vid_cap		= pipecam_try_fmt,
 	.vidioc_enum_framesizes		= pipecam_enum_framesizes,
-	.vidioc_enum_frameintervals	= pipecam_enum_frameintervals,
 	.vidioc_enum_input		= pipecam_enum_input,
 	.vidioc_g_input			= pipecam_g_input,
 	.vidioc_s_input			= pipecam_s_input,
-	.vidioc_g_parm			= pipecam_g_parm,
-	.vidioc_s_parm			= pipecam_g_parm,
 
 	.vidioc_reqbufs			= vb2_ioctl_reqbufs,
 	.vidioc_create_bufs		= vb2_ioctl_create_bufs,
@@ -769,9 +703,6 @@ static const struct v4l2_ioctl_ops pipecam_ioctl_ops = {
 	.vidioc_expbuf			= vb2_ioctl_expbuf,
 	.vidioc_streamon		= vb2_ioctl_streamon,
 	.vidioc_streamoff		= vb2_ioctl_streamoff,
-
-	.vidioc_subscribe_event		= v4l2_ctrl_subscribe_event,
-	.vidioc_unsubscribe_event	= v4l2_event_unsubscribe,
 };
 
 static const struct v4l2_file_operations pipecam_fops = {
@@ -792,6 +723,7 @@ static void pipecam_release(struct v4l2_device *v4l2_dev)
 {
 	struct pipecam *dev = container_of(v4l2_dev, struct pipecam, v4l2_dev);
 
+	pipecam_free_urbs(dev);
 	v4l2_device_unregister(&dev->v4l2_dev);
 	usb_put_intf(dev->intf);
 	usb_put_dev(dev->udev);
@@ -894,6 +826,16 @@ static int pipecam_probe(struct usb_interface *intf,
 		goto err_v4l2;
 	}
 
+	/* Keep the transfer pool for the device lifetime.  STREAMOFF only kills
+	 * submissions, so repeated capture cycles cannot fail because memory has
+	 * become too fragmented to rebuild this high-order allocation pool.
+	 */
+	ret = pipecam_alloc_urbs(dev);
+	if (ret) {
+		dev_err(&intf->dev, "URB pool allocation failed\n");
+		goto err_v4l2;
+	}
+
 	strscpy(dev->vdev.name, PIPECAM_CARD, sizeof(dev->vdev.name));
 	dev->vdev.v4l2_dev	= &dev->v4l2_dev;
 	dev->vdev.fops		= &pipecam_fops;
@@ -921,11 +863,67 @@ err_v4l2:
 	v4l2_device_put(&dev->v4l2_dev);
 	return ret;
 err_free:
+	pipecam_free_urbs(dev);
 	usb_put_intf(dev->intf);
 	usb_put_dev(dev->udev);
 	mutex_destroy(&dev->lock);
 	kfree(dev);
 	return ret;
+}
+
+/* Preserve the registered node across system sleep and USB reset, but make
+ * interrupted capture explicitly recoverable instead of attempting to resume
+ * a partially assembled frame.  The VB2 error is cleared by STREAMOFF; the
+ * following STREAMON resets assembly state and resubmits the retained URBs.
+ */
+static void pipecam_quiesce(struct pipecam *dev)
+{
+	if (!vb2_is_streaming(&dev->queue))
+		return;
+
+	pipecam_fail_stream(dev);
+	pipecam_kill_urbs(dev);
+}
+
+static int pipecam_suspend(struct usb_interface *intf, pm_message_t message)
+{
+	struct pipecam *dev = usb_get_intfdata(intf);
+
+	if (!dev)
+		return 0;
+
+	mutex_lock(&dev->lock);
+	pipecam_quiesce(dev);
+	mutex_unlock(&dev->lock);
+	return 0;
+}
+
+static int pipecam_resume(struct usb_interface *intf)
+{
+	struct pipecam *dev = usb_get_intfdata(intf);
+	int ret = 0;
+
+	if (!dev)
+		return 0;
+
+	mutex_lock(&dev->lock);
+	if (dev->present)
+		ret = pipecam_set_idle(dev);
+	mutex_unlock(&dev->lock);
+	return ret;
+}
+
+static int pipecam_pre_reset(struct usb_interface *intf)
+{
+	struct pipecam *dev = usb_get_intfdata(intf);
+
+	if (!dev)
+		return 0;
+
+	mutex_lock(&dev->lock);
+	pipecam_quiesce(dev);
+	mutex_unlock(&dev->lock);
+	return 0;
 }
 
 static void pipecam_disconnect(struct usb_interface *intf)
@@ -970,6 +968,11 @@ static struct usb_driver pipecam_driver = {
 	.name		= PIPECAM_DRIVER,
 	.probe		= pipecam_probe,
 	.disconnect	= pipecam_disconnect,
+	.suspend	= pipecam_suspend,
+	.resume		= pipecam_resume,
+	.reset_resume	= pipecam_resume,
+	.pre_reset	= pipecam_pre_reset,
+	.post_reset	= pipecam_resume,
 	.id_table	= pipecam_table,
 };
 
