@@ -576,8 +576,9 @@ static void pipecam_stop_streaming(struct vb2_queue *q)
 	pipecam_free_urbs(dev);
 
 	/* Altsetting 0 has no IN endpoint, which stops the stream.  Skip the
-	 * transfer if the device is already gone - stop_streaming still runs
-	 * when a client closes its fd after disconnect.
+	 * transfer when tearing down from disconnect (present is cleared
+	 * first): the device is gone, or the core reclaims the interface
+	 * right after unbind anyway.
 	 */
 	if (dev->present)
 		usb_set_interface(dev->udev, PIPECAM_IFNUM, PIPECAM_ALT_IDLE);
@@ -628,8 +629,14 @@ static void pipecam_fill_fmt(struct v4l2_format *f)
 	p->bytesperline	= PIPECAM_BPL;
 	p->sizeimage	= PIPECAM_IMGSIZE;
 	p->colorspace	= V4L2_COLORSPACE_SRGB;
-	/* The sensor emits full-range YCbCr (measured luma 6..254). */
+	/* The sensor emits full-range BT.601 YCbCr (measured luma 6..254). */
 	p->quantization	= V4L2_QUANTIZATION_FULL_RANGE;
+	p->ycbcr_enc	= V4L2_YCBCR_ENC_601;
+	p->xfer_func	= V4L2_XFER_FUNC_SRGB;
+	/* Every field must be written: TRY/S_FMT replies would otherwise echo
+	 * caller-supplied values (SET_CSC in particular is not supported).
+	 */
+	p->flags	= 0;
 }
 
 static int pipecam_g_fmt(struct file *file, void *priv, struct v4l2_format *f)
@@ -729,6 +736,10 @@ static int pipecam_g_parm(struct file *file, void *priv,
 	 * response.
 	 */
 	parm->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
+	/* S_PARM shares this handler; overwrite the caller's capturemode
+	 * rather than echoing it (high-quality mode is not supported).
+	 */
+	parm->parm.capture.capturemode = 0;
 	parm->parm.capture.timeperframe.numerator = us;
 	parm->parm.capture.timeperframe.denominator = USEC_PER_SEC;
 	parm->parm.capture.readbuffers = 2;
@@ -782,6 +793,7 @@ static void pipecam_release(struct v4l2_device *v4l2_dev)
 	struct pipecam *dev = container_of(v4l2_dev, struct pipecam, v4l2_dev);
 
 	v4l2_device_unregister(&dev->v4l2_dev);
+	usb_put_intf(dev->intf);
 	usb_put_dev(dev->udev);
 	mutex_destroy(&dev->lock);
 	kfree(dev);
@@ -842,7 +854,10 @@ static int pipecam_probe(struct usb_interface *intf,
 		return -ENOMEM;
 
 	dev->udev = usb_get_dev(udev);
-	dev->intf = intf;
+	/* dev->intf is dereferenced from URB completion; pin it for the
+	 * lifetime of dev, which can outlast the unbind.
+	 */
+	dev->intf = usb_get_intf(intf);
 	dev->present = true;
 	mutex_init(&dev->lock);
 	spin_lock_init(&dev->qlock);
@@ -906,6 +921,7 @@ err_v4l2:
 	v4l2_device_put(&dev->v4l2_dev);
 	return ret;
 err_free:
+	usb_put_intf(dev->intf);
 	usb_put_dev(dev->udev);
 	mutex_destroy(&dev->lock);
 	kfree(dev);
@@ -926,12 +942,16 @@ static void pipecam_disconnect(struct usb_interface *intf)
 	vb2_queue_error(&dev->queue);
 	mutex_unlock(&dev->lock);
 
-	video_unregister_device(&dev->vdev);
+	/* Stop streaming here, not at last close: URB completions must not
+	 * outlive disconnect, where the USB core is about to drop its
+	 * interface reference and reclaim the endpoints.
+	 */
+	vb2_video_unregister_device(&dev->vdev);
 	v4l2_device_disconnect(&dev->v4l2_dev);
 
 	/* Frees dev via pipecam_release() once the last user goes away; the
-	 * USB reference is dropped there, not here, because stop_streaming()
-	 * may still run from a client closing its fd after this returns.
+	 * USB references are dropped there, not here, because open fds still
+	 * reach dev->queue and dev->lock after this returns.
 	 */
 	v4l2_device_put(&dev->v4l2_dev);
 }
