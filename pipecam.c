@@ -649,6 +649,10 @@ static const struct vb2_ops pipecam_vb2_ops = {
 	.buf_queue		= pipecam_buf_queue,
 	.start_streaming	= pipecam_start_streaming,
 	.stop_streaming		= pipecam_stop_streaming,
+#ifdef PIPECAM_HAVE_VB2_WAIT_OPS
+	.wait_prepare		= vb2_ops_wait_prepare,
+	.wait_finish		= vb2_ops_wait_finish,
+#endif
 };
 
 /* ------------------------------------------------------------------ */
@@ -889,6 +893,7 @@ static int pipecam_probe(struct usb_interface *intf,
 	q = &dev->queue;
 	q->type			= V4L2_BUF_TYPE_VIDEO_CAPTURE;
 	q->io_modes		= VB2_MMAP | VB2_USERPTR | VB2_DMABUF | VB2_READ;
+	q->dev			= &intf->dev;
 	q->drv_priv		= dev;
 	q->buf_struct_size	= sizeof(struct pipecam_buf);
 	q->ops			= &pipecam_vb2_ops;
@@ -998,8 +1003,24 @@ static int pipecam_pre_reset(struct usb_interface *intf)
 
 	mutex_lock(&dev->lock);
 	pipecam_quiesce(dev);
-	mutex_unlock(&dev->lock);
 	return 0;
+}
+
+static int pipecam_post_reset(struct usb_interface *intf)
+{
+	struct pipecam *dev = usb_get_intfdata(intf);
+	int ret = 0;
+
+	if (!dev)
+		return 0;
+
+	/* Paired with pre_reset(): keep userspace queue operations excluded
+	 * until usbcore has completed the reset and I/O is legal again.
+	 */
+	if (dev->present)
+		ret = pipecam_set_idle(dev);
+	mutex_unlock(&dev->lock);
+	return ret;
 }
 
 static void pipecam_disconnect(struct usb_interface *intf)
@@ -1049,7 +1070,7 @@ static struct usb_driver pipecam_driver = {
 	.resume		= pipecam_resume,
 	.reset_resume	= pipecam_resume,
 	.pre_reset	= pipecam_pre_reset,
-	.post_reset	= pipecam_resume,
+	.post_reset	= pipecam_post_reset,
 	.id_table	= pipecam_table,
 };
 

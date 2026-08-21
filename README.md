@@ -298,6 +298,14 @@ puts the VB2 queue into error rather than continuing a partial frame. Userspace
 must issue `STREAMOFF`, requeue its buffers, and issue `STREAMON`; applications
 that close and reopen the node already perform an equivalent recovery.
 
+Blocking `read()` and `DQBUF` calls release the queue mutex while they sleep, so
+disconnect, suspend, and reset can always wake them with an error. During a USB
+reset the same mutex remains held from `pre_reset` through `post_reset`, which
+prevents userspace from starting new URBs inside usbcore's reset window.
+Targets that expose VB2's legacy wait callbacks use them; newer or backported
+VB2 cores perform the same unlock/relock directly from the configured queue
+lock.
+
 ## Verification performed
 
 The hardware results below are the established baseline from before the current
