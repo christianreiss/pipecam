@@ -6,7 +6,7 @@ binds it and it is invisible as a webcam on a stock system.
 
 * **Format:** 450×450, `YUYV` (YUV 4:2:2), full-range
 * **Frame rate:** ~20–27 fps, sensor-controlled (see [Frame rate](#frame-rate))
-* **Status:** `v4l2-compliance` 57/57, 0 failures, 0 warnings
+* **Hardware baseline:** `v4l2-compliance` 57/57, 0 failures, 0 warnings
 * **Developed and tested on:** Fedora 43, kernel 7.1.7
 
 ---
@@ -124,6 +124,11 @@ There is **no vendor "start" command**. Selecting altsetting 1 starts the data
 flow; selecting altsetting 0 stops it, because that altsetting has no IN
 endpoint. That is the driver's entire streamon/streamoff mechanism.
 
+URB completions are gated by an explicit `STARTING`/`RUNNING`/`STOPPING` state.
+During startup they may keep the USB queue full, but they cannot deliver frames
+until all 16 initial submissions have succeeded. A fatal completion during that
+window makes `STREAMON` fail and synchronously kills every submitted URB.
+
 ### Payload framing
 
 The stream is a sequence of variable-length logical packets, each carrying a
@@ -131,7 +136,8 @@ The stream is a sequence of variable-length logical packets, each carrying a
 
 ```
 byte 0     bHeaderLength   always 12
-byte 1     bmHeaderInfo    bit0 FID, bit1 EOF, bit2 PTS, bit3 SCR, bit7 EOH
+byte 1     bmHeaderInfo    bit0 FID, bit1 EOF, bit2 PTS, bit3 SCR,
+                           bit6 ERR, bit7 EOH
 byte 2..5  PTS
 byte 6..11 SCR
 ```
@@ -295,9 +301,9 @@ that close and reopen the node already perform an equivalent recovery.
 ## Verification performed
 
 The hardware results below are the established baseline from before the current
-interval-UAPI and suspend/reset hardening. They remain regression targets and
-must be rerun on the physical camera; the wire format and successful-frame path
-did not change, while malformed-frame rejection became stricter.
+interval-UAPI, suspend/reset, and startup-race hardening. They remain regression
+targets and must be rerun on the physical camera; the wire format did not
+change, while malformed-frame rejection became stricter.
 
 | Test | Result |
 |---|---|

@@ -93,6 +93,14 @@ struct pipecam_buf {
 	struct list_head	list;
 };
 
+enum pipecam_stream_state {
+	PIPECAM_STOPPED,
+	PIPECAM_STARTING,
+	PIPECAM_RUNNING,
+	PIPECAM_STOPPING,
+	PIPECAM_FAILED,
+};
+
 struct pipecam {
 	struct v4l2_device	v4l2_dev;
 	struct video_device	vdev;
@@ -107,13 +115,14 @@ struct pipecam {
 
 	struct urb		*urb[PIPECAM_NURBS];
 	unsigned int		urb_errors;
-	bool			stream_failed;
+	enum pipecam_stream_state stream_state;
 	struct list_head	buf_list;
 
 	/* Frame assembly state, touched from URB completion under qlock. */
 	struct pipecam_buf	*cur;
 	void			*cur_vaddr;
 	unsigned int		cur_off;
+	unsigned int		frame_bytes;
 	bool			fid_valid;
 	bool			frame_synced;
 	bool			frame_bad;
@@ -136,10 +145,12 @@ static void pipecam_frame_end(struct pipecam *dev)
 	struct pipecam_buf *buf = dev->cur;
 	u64 now;
 	u32 sequence;
+	unsigned int bytes = dev->frame_bytes;
 	bool bad = dev->frame_bad;
 	bool synced = dev->frame_synced;
 
 	dev->frame_bad = false;
+	dev->frame_bytes = 0;
 
 	/* After initial synchronization, count every frame boundary, including
 	 * frames dropped because userspace supplied no buffer or because the
@@ -153,7 +164,8 @@ static void pipecam_frame_end(struct pipecam *dev)
 	 * every URB was submitted.  Use it for synchronization, but do not report
 	 * that unavoidable partial frame as a userspace-visible drop.
 	 */
-	if (!synced && (bad || !buf || dev->cur_off != PIPECAM_IMGSIZE)) {
+	if (!synced && (bad || !buf || bytes != PIPECAM_IMGSIZE ||
+			dev->cur_off != PIPECAM_IMGSIZE)) {
 		if (buf)
 			dev->cur_off = 0;
 		return;
@@ -168,7 +180,8 @@ static void pipecam_frame_end(struct pipecam *dev)
 	 * whenever a URB is dropped; recycle the buffer instead of delivering
 	 * a torn image.
 	 */
-	if (bad || dev->cur_off != PIPECAM_IMGSIZE) {
+	if (bad || bytes != PIPECAM_IMGSIZE ||
+	    dev->cur_off != PIPECAM_IMGSIZE) {
 		dev->cur_off = 0;
 		return;
 	}
@@ -192,6 +205,14 @@ static void pipecam_append(struct pipecam *dev, const u8 *p, int n)
 	if (n <= 0)
 		return;
 
+	if (dev->frame_bytes >= PIPECAM_IMGSIZE ||
+	    n > PIPECAM_IMGSIZE - dev->frame_bytes) {
+		dev->frame_bad = true;
+		dev->frame_bytes = PIPECAM_IMGSIZE + 1;
+		return;
+	}
+	dev->frame_bytes += n;
+
 	if (!dev->cur) {
 		if (list_empty(&dev->buf_list))
 			return;		/* no buffer available - drop */
@@ -208,20 +229,10 @@ static void pipecam_append(struct pipecam *dev, const u8 *p, int n)
 		}
 	}
 
-	if (dev->cur_off >= PIPECAM_IMGSIZE) {
-		/* More payload after a complete image makes the frame unusable. */
-		dev->cur_off = PIPECAM_IMGSIZE + 1;
-		return;
-	}
-
 	room = PIPECAM_IMGSIZE - dev->cur_off;
 	if (n > room) {
-		/* Copy only within the plane, but retain the oversize marker.  Merely
-		 * truncating here would make frame_end() accept a corrupt frame when
-		 * the oversized payload also carried EOF.
-		 */
-		memcpy(dev->cur_vaddr + dev->cur_off, p, room);
-		dev->cur_off = PIPECAM_IMGSIZE + 1;
+		/* The buffer was acquired after this logical frame began. */
+		dev->frame_bad = true;
 		return;
 	}
 
@@ -240,7 +251,7 @@ static void pipecam_process(struct pipecam *dev, const u8 *data, int len)
 	int off;
 
 	spin_lock_irqsave(&dev->qlock, flags);
-	if (dev->stream_failed)
+	if (dev->stream_state != PIPECAM_RUNNING)
 		goto unlock;
 
 	for (off = 0; off < len; off += PIPECAM_USB_PKT) {
@@ -293,14 +304,17 @@ unlock:
 static bool pipecam_fail_stream(struct pipecam *dev)
 {
 	unsigned long flags;
-	bool first;
+	bool first, notify;
 
 	spin_lock_irqsave(&dev->qlock, flags);
-	first = !dev->stream_failed;
-	dev->stream_failed = true;
+	first = dev->stream_state == PIPECAM_STARTING ||
+		dev->stream_state == PIPECAM_RUNNING;
+	notify = dev->stream_state == PIPECAM_RUNNING;
+	if (first)
+		dev->stream_state = PIPECAM_FAILED;
 	spin_unlock_irqrestore(&dev->qlock, flags);
 
-	if (first)
+	if (notify)
 		vb2_queue_error(&dev->queue);
 	return first;
 }
@@ -309,7 +323,7 @@ static void pipecam_urb_complete(struct urb *urb)
 {
 	struct pipecam *dev = urb->context;
 	unsigned long flags;
-	bool stop, first;
+	bool active, process, stop, first, notify;
 	int ret;
 
 	switch (urb->status) {
@@ -326,13 +340,23 @@ static void pipecam_urb_complete(struct urb *urb)
 		 * the user can recover by restarting the stream.
 		 */
 		spin_lock_irqsave(&dev->qlock, flags);
-		stop = dev->stream_failed;
+		active = dev->stream_state == PIPECAM_STARTING ||
+			 dev->stream_state == PIPECAM_RUNNING;
+		stop = !active;
 		first = false;
-		if (!stop && (urb->status == -EPIPE ||
-			      ++dev->urb_errors >= PIPECAM_MAX_URB_ERRORS)) {
-			dev->stream_failed = true;
-			stop = true;
-			first = true;
+		notify = false;
+		if (active) {
+			/* Error completions may still contain partial data.  Discard it
+			 * and poison the logical frame independently of buffer ownership.
+			 */
+			dev->frame_bad = true;
+			if (urb->status == -EPIPE ||
+			    ++dev->urb_errors >= PIPECAM_MAX_URB_ERRORS) {
+				notify = dev->stream_state == PIPECAM_RUNNING;
+				dev->stream_state = PIPECAM_FAILED;
+				stop = true;
+				first = true;
+			}
 		}
 		spin_unlock_irqrestore(&dev->qlock, flags);
 
@@ -344,7 +368,8 @@ static void pipecam_urb_complete(struct urb *urb)
 			dev_err(&dev->intf->dev,
 				"endpoint failing (status %d) - stopping stream; restart capture to recover\n",
 				urb->status);
-			vb2_queue_error(&dev->queue);
+			if (notify)
+				vb2_queue_error(&dev->queue);
 		}
 		if (stop)
 			return;
@@ -353,17 +378,26 @@ static void pipecam_urb_complete(struct urb *urb)
 	}
 
 	spin_lock_irqsave(&dev->qlock, flags);
-	stop = dev->stream_failed;
-	if (!stop)
+	active = dev->stream_state == PIPECAM_STARTING ||
+		 dev->stream_state == PIPECAM_RUNNING;
+	process = dev->stream_state == PIPECAM_RUNNING;
+	if (active)
 		dev->urb_errors = 0;
 	spin_unlock_irqrestore(&dev->qlock, flags);
-	if (stop)
+	if (!active)
 		return;
 
-	if (urb->actual_length > 0)
+	if (process && urb->actual_length > 0)
 		pipecam_process(dev, urb->transfer_buffer, urb->actual_length);
 
 resubmit:
+	spin_lock_irqsave(&dev->qlock, flags);
+	active = dev->stream_state == PIPECAM_STARTING ||
+		 dev->stream_state == PIPECAM_RUNNING;
+	spin_unlock_irqrestore(&dev->qlock, flags);
+	if (!active)
+		return;
+
 	ret = usb_submit_urb(urb, GFP_ATOMIC);
 	/* -EPERM/-ENODEV/-ESHUTDOWN/-ENOENT are the normal teardown races. */
 	if (ret && ret != -EPERM && ret != -ENODEV &&
@@ -491,8 +525,8 @@ static int pipecam_set_idle(struct pipecam *dev)
 
 	ret = usb_set_interface(dev->udev, PIPECAM_IFNUM, PIPECAM_ALT_IDLE);
 	if (ret)
-		dev_dbg(&dev->intf->dev,
-			"failed to restore idle altsetting: %d\n", ret);
+		dev_warn(&dev->intf->dev,
+			 "failed to restore idle altsetting: %d\n", ret);
 	return ret;
 }
 
@@ -502,7 +536,7 @@ static int pipecam_start_streaming(struct vb2_queue *q, unsigned int count)
 	unsigned int pipe = usb_rcvbulkpipe(dev->udev,
 			PIPECAM_EP_IN & USB_ENDPOINT_NUMBER_MASK);
 	unsigned long flags;
-	int i, ret;
+	int i, ret, submitted = 0;
 
 	if (!dev->present) {
 		pipecam_return_buffers(dev, VB2_BUF_STATE_QUEUED);
@@ -513,12 +547,13 @@ static int pipecam_start_streaming(struct vb2_queue *q, unsigned int count)
 	dev->cur = NULL;
 	dev->cur_vaddr = NULL;
 	dev->cur_off = 0;
+	dev->frame_bytes = 0;
 	dev->fid_valid = false;
 	dev->frame_synced = false;
 	dev->frame_bad = false;
 	dev->sequence = 0;
 	dev->urb_errors = 0;
-	dev->stream_failed = false;
+	dev->stream_state = PIPECAM_STARTING;
 	spin_unlock_irqrestore(&dev->qlock, flags);
 
 	/* Selecting the streaming altsetting is what starts the data flow. */
@@ -545,15 +580,39 @@ static int pipecam_start_streaming(struct vb2_queue *q, unsigned int count)
 				"URB %d submit failed: %d\n", i, ret);
 			goto err_urbs;
 		}
+		submitted++;
+
+		spin_lock_irqsave(&dev->qlock, flags);
+		if (dev->stream_state == PIPECAM_FAILED)
+			ret = -EIO;
+		spin_unlock_irqrestore(&dev->qlock, flags);
+		if (ret)
+			goto err_urbs;
 	}
-	return 0;
+
+	spin_lock_irqsave(&dev->qlock, flags);
+	if (dev->stream_state == PIPECAM_STARTING) {
+		dev->stream_state = PIPECAM_RUNNING;
+		ret = 0;
+	} else {
+		ret = -EIO;
+	}
+	spin_unlock_irqrestore(&dev->qlock, flags);
+	if (!ret)
+		return 0;
 
 err_urbs:
-	while (i--)
-		usb_kill_urb(dev->urb[i]);
+	spin_lock_irqsave(&dev->qlock, flags);
+	dev->stream_state = PIPECAM_STOPPING;
+	spin_unlock_irqrestore(&dev->qlock, flags);
+	while (submitted--)
+		usb_kill_urb(dev->urb[submitted]);
 err_alt:
 	pipecam_set_idle(dev);
 err:
+	spin_lock_irqsave(&dev->qlock, flags);
+	dev->stream_state = PIPECAM_STOPPED;
+	spin_unlock_irqrestore(&dev->qlock, flags);
 	pipecam_return_buffers(dev, VB2_BUF_STATE_QUEUED);
 	return ret;
 }
@@ -561,6 +620,11 @@ err:
 static void pipecam_stop_streaming(struct vb2_queue *q)
 {
 	struct pipecam *dev = vb2_get_drv_priv(q);
+	unsigned long flags;
+
+	spin_lock_irqsave(&dev->qlock, flags);
+	dev->stream_state = PIPECAM_STOPPING;
+	spin_unlock_irqrestore(&dev->qlock, flags);
 
 	pipecam_kill_urbs(dev);
 
@@ -573,6 +637,10 @@ static void pipecam_stop_streaming(struct vb2_queue *q)
 		pipecam_set_idle(dev);
 
 	pipecam_return_buffers(dev, VB2_BUF_STATE_ERROR);
+
+	spin_lock_irqsave(&dev->qlock, flags);
+	dev->stream_state = PIPECAM_STOPPED;
+	spin_unlock_irqrestore(&dev->qlock, flags);
 }
 
 static const struct vb2_ops pipecam_vb2_ops = {
@@ -734,8 +802,8 @@ static void pipecam_release(struct v4l2_device *v4l2_dev)
 static int pipecam_validate_interface(struct usb_interface *intf)
 {
 	struct usb_host_interface *idle, *stream;
-	struct usb_endpoint_descriptor *ep;
-	int i, ret;
+	struct usb_endpoint_descriptor *ep = NULL;
+	int i;
 
 	idle = usb_altnum_to_altsetting(intf, PIPECAM_ALT_IDLE);
 	stream = usb_altnum_to_altsetting(intf, PIPECAM_ALT_STREAM);
@@ -759,8 +827,16 @@ static int pipecam_validate_interface(struct usb_interface *intf)
 		if (usb_endpoint_dir_in(&idle->endpoint[i].desc))
 			return -ENODEV;
 
-	ret = usb_find_bulk_in_endpoint(stream, &ep);
-	if (ret || ep->bEndpointAddress != PIPECAM_EP_IN ||
+	/* Match the protocol's exact endpoint rather than assuming that the first
+	 * bulk-IN endpoint belongs to the video stream.
+	 */
+	for (i = 0; i < stream->desc.bNumEndpoints; i++)
+		if (stream->endpoint[i].desc.bEndpointAddress == PIPECAM_EP_IN) {
+			ep = &stream->endpoint[i].desc;
+			break;
+		}
+
+	if (!ep || !usb_endpoint_is_bulk_in(ep) ||
 	    usb_endpoint_maxp(ep) != PIPECAM_USB_PKT)
 		return -ENODEV;
 
@@ -937,6 +1013,7 @@ static void pipecam_disconnect(struct usb_interface *intf)
 
 	mutex_lock(&dev->lock);
 	dev->present = false;
+	pipecam_fail_stream(dev);
 	vb2_queue_error(&dev->queue);
 	mutex_unlock(&dev->lock);
 
@@ -980,5 +1057,5 @@ module_usb_driver(pipecam_driver);
 
 MODULE_AUTHOR("Christian Reiss <email@christian-reiss.de>");
 MODULE_DESCRIPTION("V4L2 driver for Look Kellyop lem01camera USB pipe camera");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_VERSION("1.0");
